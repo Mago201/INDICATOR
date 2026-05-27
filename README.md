@@ -1,6 +1,7 @@
 # SmartMoneyVolume — индикатор для MetaTrader 5
 
 **v1.20** — добавлены **Entry signals** (стрелки точки входа по совпадению условий) + исправление производительности.
+**v1.30** — расширенный **Entry engine**: Premium/Discount фильтр, Strong (displacement) Order Blocks, авто SL/TP с фильтром по R:R, Score-режим вместо all-or-nothing, cooldown / anti-clustering, rejection-фитиль, VP confluence.
 
 Один индикатор объединяет:
 - **Smart Money Concepts (SMC)** — структура, BOS, CHoCH, OB, FVG, sweeps
@@ -129,6 +130,64 @@
 | Контртрендовый разворот | — | — | ✓ | ✓ | ✓ | ✓ |
 
 > **Примечание:** для бычьего входа условие «sweep в обратную сторону» означает sweep лоёв (взяли стопы продавцов снизу). Для медвежьего — sweep хаёв.
+
+### Расширенные Entry-фильтры (v1.30)
+
+Дополнительные фильтры качества — каждый можно включить независимо. Если ни один не активирован, индикатор работает по старой схеме «AND всех чекбоксов».
+
+#### Premium / Discount
+Классика SMC: BUY имеет смысл в нижней половине последнего диапазона `[lastL .. lastH]` (discount), SELL — в верхней (premium). Отсекает значительную часть «плохих» точек.
+- `InpEntryNeedPremDisc` — включить фильтр.
+- `InpEntryPremDiscMTF` — брать диапазон с MTF-структуры вместо текущего ТФ.
+- `InpEntryPremDiscMid` — граница (0.5 = ровно середина).
+- `InpEntryPremDiscDelta` — буфер от середины (0.05 = 5% от диапазона).
+
+#### Strong / Displacement Order Blocks
+OB помечается как «сильный» если сразу после него был импульс с FVG (institutional displacement). Такие OB рисуются **толще** (`WIDTH=2`).
+- `InpEntryNeedStrongOB` — давать сигнал только из «сильных» OB.
+- `InpEntryOBImpulseMaxBars` — макс. баров после OB для поиска FVG-импульса (по умолчанию 6).
+
+#### Auto SL/TP + R:R фильтр
+Автоматический расчёт стопа и целей; стрелка появляется только если соотношение риск/прибыль ≥ порога.
+- `InpEntryNeedRR` — жёсткий фильтр по RR.
+- `InpEntryMinRR` — минимальное R:R (рекомендую 1.5–2.0).
+- `InpEntrySLATRMult` — буфер SL за границу OB в долях ATR (0.30 = ATR×0.3).
+- `InpEntryATRPeriod` — период ATR (14 по умолчанию).
+- `InpEntryUseVPForTP` — учитывать POC/VAH/VAL как кандидатов для TP.
+- `InpEntryShowLevels` — рисовать пунктиры SL (красный, dash) / TP1 / TP2 (зелёный, dot) у стрелки.
+- `InpEntryShowLabel` — текст «s7 RR2.30» рядом со стрелкой.
+- `InpEntryLevelsBars` — длина пунктиров вправо (баров).
+
+Кандидаты TP: ближайший противоположный OB → POC/VAH/VAL → последний свинг. Сортируются по расстоянию от текущей цены.
+
+#### Rejection wick
+Бар сигнала должен иметь явную реакцию — нижний фитиль > body для BUY (или верхний для SELL).
+- `InpEntryNeedReject` — требовать rejection.
+
+#### Cooldown / anti-clustering
+Не давать «гирлянды» стрелок на одном движении.
+- `InpEntryCooldownBars` — N баров «тишины» после стрелки того же направления.
+- `InpEntryMinDistATR` — минимальная дистанция от прошлой стрелки в ATR (0.5–1.0 типично).
+
+### Score-режим (вместо «всё или ничего»)
+Каждое условие даёт N очков; стрелка появляется когда `score ≥ MinScore`. Удобно когда хочется «3-из-4 совпало = достаточно».
+
+- `InpEntryUseScore` — включить score-режим.
+- `InpEntryMinScore` — порог (по умолчанию 6).
+- `InpEntryWeight*` — веса каждого условия (Trend, MTF, OB, StrongOB, Volume, Sweep, Struct, PremDisc, RR, VPCnflu, Reject).
+
+> Если включён `Use Score` + любой `Need*` — этот `Need*` становится **жёстким гейтом** (не очко, а обязательное условие). Удобно: «считаем score, но без OB вообще не входим».
+
+В дашборде показывается режим (`Mode: score >= 6` или `AND-gates`) и активные фильтры.
+
+**Рекомендуемые пресеты v1.30:**
+
+| Пресет | Score? | Min | Need-гейты | Min RR | PremDisc | StrongOB | Cooldown |
+|---|---|---|---|---|---|---|---|
+| **Качество (мало, точно)** | ✓ | 8 | Trend, OB, StrongOB | 2.0 | ✓ | ✓ | 5 |
+| **Сбалансированный** | ✓ | 6 | Trend, OB | 1.5 | ✓ | — | 3 |
+| **Лояльный (много, для скрининга)** | ✓ | 4 | OB | 1.0 | — | — | 0 |
+| **Контртренд по sweep+CHoCH** | ✓ | 6 | OB, Sweep, Struct | 1.5 | ✓ | — | 5 |
 
 ### Прочее
 - `InpObjPrefix` — префикс имён объектов (изолирует индикатор от других).
