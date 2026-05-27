@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.10"
+#property version   "1.30"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 4
@@ -130,6 +130,46 @@ input int      InpEntryArrowWidth    = 4;           // Толщина стрел
 input int      InpEntryArrowShift    = 30;          // Смещение в пикселях от свечи
 input bool     InpEntryAlert         = false;       // Алерт при появлении entry-сигнала
 
+input group "=== Entry filters (расширенные) ==="
+input bool     InpEntryNeedPremDisc      = false;   // Требовать Premium/Discount (BUY в нижней половине, SELL в верхней)
+input bool     InpEntryPremDiscMTF       = false;   // Брать диапазон с MTF, иначе с текущего ТФ
+input double   InpEntryPremDiscMid       = 0.50;    // Граница (0.5 = середина диапазона)
+input double   InpEntryPremDiscDelta     = 0.05;    // Буфер от середины (0..0.5)
+
+input bool     InpEntryNeedStrongOB      = false;   // Требовать "сильный" OB (с FVG-импульсом сразу после)
+input int      InpEntryOBImpulseMaxBars  = 6;       // Макс. баров после OB для поиска FVG-импульса
+
+input bool     InpEntryNeedReject        = false;   // Требовать rejection-фитиль на баре сигнала
+input bool     InpEntryNeedRR            = false;   // Жёсткий фильтр по RR (не давать сигнал, если ниже мин.)
+input double   InpEntryMinRR             = 1.5;     // Минимальное R:R для сигнала
+input double   InpEntrySLATRMult         = 0.30;    // Буфер SL за границу OB (доли ATR)
+input int      InpEntryATRPeriod         = 14;      // Период ATR
+input bool     InpEntryUseVPForTP        = true;    // Учитывать POC/VAH/VAL как кандидатов TP
+
+input bool     InpEntryShowLevels        = true;    // Рисовать SL/TP1/TP2 у стрелки
+input color    InpEntrySLColor           = clrCrimson;
+input color    InpEntryTPColor           = clrSeaGreen;
+input int      InpEntryLevelsBars        = 12;      // Длина пунктиров SL/TP вправо (баров)
+input bool     InpEntryShowLabel         = true;    // Подпись у стрелки (score / RR)
+
+input int      InpEntryCooldownBars      = 0;       // Cooldown между сигналами одного направления (0=выкл)
+input double   InpEntryMinDistATR        = 0.0;     // Мин. дистанция от прошлого сигнала, в ATR (0=выкл)
+
+input group "=== Entry score (анти всё-или-ничего) ==="
+input bool     InpEntryUseScore          = false;   // Score-режим вместо AND-фильтра
+input int      InpEntryMinScore          = 6;       // Мин. сумма очков для сигнала
+input int      InpEntryWeightTrend       = 2;       // Вес: совпадение с трендом ТФ
+input int      InpEntryWeightMTF         = 2;       // Вес: совпадение с MTF
+input int      InpEntryWeightOB          = 2;       // Вес: цена в активном OB
+input int      InpEntryWeightStrongOB    = 2;       // Вес: OB сильный (displacement)
+input int      InpEntryWeightVolume      = 1;       // Вес: бар громкий
+input int      InpEntryWeightSweep       = 2;       // Вес: недавний sweep
+input int      InpEntryWeightStruct      = 2;       // Вес: недавний BOS/CHoCH
+input int      InpEntryWeightPremDisc    = 2;       // Вес: Premium/Discount ОК
+input int      InpEntryWeightRR          = 1;       // Вес: RR >= MinRR
+input int      InpEntryWeightVPCnflu     = 1;       // Вес: близость к POC/VAH/VAL
+input int      InpEntryWeightReject      = 1;       // Вес: rejection-фитиль
+
 input group "=== Производительность ==="
 input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
 input bool     InpHeavyOnNewBarOnly= true;        // Тяжёлые задачи (mitigation/dashboard/VP) только на новом баре
@@ -191,6 +231,7 @@ struct OBData
    bool     bull;
    bool     mitigated;
    bool     mtf;
+   bool     strong;     // OB после которого был FVG-импульс (displacement)
    datetime checkedUpTo;  // время последнего проверенного бара (для инкремент. mitigation)
 };
 
@@ -207,6 +248,7 @@ struct Counters
    int mtfBosBull, mtfBosBear;
    int mtfChochBull, mtfChochBear;
    int entryUp, entryDn;
+   int obStrongBull, obStrongBear;
 };
 
 SwingState g_state;
@@ -225,6 +267,19 @@ datetime   g_lastSweepHighTime = 0;  // была снята ликвидност
 datetime   g_lastSweepLowTime  = 0;  // была снята ликвидность с низа
 datetime   g_lastBullStructTime = 0; // последний BOS/CHoCH вверх
 datetime   g_lastBearStructTime = 0; // последний BOS/CHoCH вниз
+
+// ATR + VP-уровни для расширенного Entry-сценария
+int        g_atrHandle    = INVALID_HANDLE;
+double     g_pocPrice     = 0.0;
+double     g_vahPrice     = 0.0;
+double     g_valPrice     = 0.0;
+bool       g_vpReady      = false;
+
+// Антиклустеринг / cooldown
+datetime   g_lastEntryUpTime  = 0;
+datetime   g_lastEntryDnTime  = 0;
+double     g_lastEntryUpPrice = 0.0;
+double     g_lastEntryDnPrice = 0.0;
 
 //+==================================================================+
 //| OnInit / OnDeinit                                                 |
@@ -274,6 +329,15 @@ int OnInit()
    g_lastSweepLowTime  = 0;
    g_lastBullStructTime = 0;
    g_lastBearStructTime = 0;
+   g_lastEntryUpTime  = 0;
+   g_lastEntryDnTime  = 0;
+   g_lastEntryUpPrice = 0.0;
+   g_lastEntryDnPrice = 0.0;
+   g_pocPrice = g_vahPrice = g_valPrice = 0.0;
+   g_vpReady  = false;
+
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   g_atrHandle = iATR(_Symbol, _Period, MathMax(2, InpEntryATRPeriod));
 
    ClearAllObjects();
    if(InpDashEnable) DashboardCreate();
@@ -283,6 +347,11 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
    ClearAllObjects();
 }
 
@@ -379,6 +448,12 @@ int OnCalculate(const int rates_total,
       g_lastSweepLowTime  = 0;
       g_lastBullStructTime = 0;
       g_lastBearStructTime = 0;
+      g_lastEntryUpTime  = 0;
+      g_lastEntryDnTime  = 0;
+      g_lastEntryUpPrice = 0.0;
+      g_lastEntryDnPrice = 0.0;
+      g_pocPrice = g_vahPrice = g_valPrice = 0.0;
+      g_vpReady  = false;
       ClearAllObjects();
       g_dashCreated = false;
       if(InpDashEnable) { DashboardCreate(); DashboardLayout(); g_dashCreated = true; }
@@ -402,6 +477,15 @@ int OnCalculate(const int rates_total,
 
    int last_confirmable = rates_total - InpSwingLength - 1;
 
+   // VP заранее на firstScan: DetectEntry в исторической прокрутке
+   // должен иметь доступ к POC/VAH/VAL для confluence-расчёта
+   if(firstScan && InpVPEnable)
+   {
+      BuildVolumeProfile();
+      g_lastVPTime   = time[rates_total - 1];
+      g_lastVPPeriod = InpVPTimeframe;
+   }
+
    //--- Основной проход по текущему ТФ
    for(int i = start; i <= last_confirmable; ++i)
    {
@@ -412,7 +496,7 @@ int OnCalculate(const int rates_total,
                          time, open, high, low, close,
                          g_state, g_ctx, _Period, InpOBExtendBars, InpOBMaxCount);
       if(InpEntryEnable)
-         DetectEntry(i, time, open, high, low, close);
+         DetectEntry(i, rates_total, time, open, high, low, close);
    }
 
    //--- Незакрытые/неподтверждённые бары: только громкие свечи (по желанию)
@@ -847,6 +931,9 @@ void TryDrawOB(int i, bool bull,
    double   lo = low[ob];
    datetime t2 = t1 + (datetime)(PeriodSeconds(tf) * obExtendBars);
 
+   // Displacement-проверка: появился ли FVG в импульсе после OB до свинга
+   bool strong = DetectImpulseFVG(ob, i, bull, high, low);
+
    string tag  = bull ? "obB_" : "obS_";
    string name = ctx.prefix + tag + IntegerToString((long)t1);
    color  clr  = bull ? ctx.obBullClr : ctx.obBearClr;
@@ -860,11 +947,11 @@ void TryDrawOB(int i, bool bull,
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
    ObjectSetInteger(0, name, OBJPROP_FILL,  true);
    ObjectSetInteger(0, name, OBJPROP_BACK,  true);
-   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, strong ? STYLE_SOLID : STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, strong ? 2 : 1);
 
    // Регистрируем в массиве для трекинга mitigation
-   AddOrUpdateOB(name, t1, hi, lo, t2, bull, ctx.isMTF);
+   AddOrUpdateOB(name, t1, hi, lo, t2, bull, ctx.isMTF, strong);
 
    if(bull) g_cnt.obBullActive++;
    else     g_cnt.obBearActive++;
@@ -874,8 +961,22 @@ void TryDrawOB(int i, bool bull,
    LimitObjectsByTag(limitTag, obMaxCount, "");
 }
 
+// Проверка наличия FVG в (obBar..swingBar] нужного направления — признак displacement
+bool DetectImpulseFVG(int obBar, int swingBar, bool bull,
+                      const double &high[], const double &low[])
+{
+   int maxK = MathMin(swingBar, obBar + InpEntryOBImpulseMaxBars);
+   for(int k = obBar + 2; k <= maxK; ++k)
+   {
+      if(k - 2 < 0) continue;
+      if(bull  && low[k]  > high[k-2]) return true;
+      if(!bull && high[k] < low[k-2])  return true;
+   }
+   return false;
+}
+
 void AddOrUpdateOB(string name, datetime t, double topP, double botP,
-                   datetime extendTo, bool bull, bool mtf)
+                   datetime extendTo, bool bull, bool mtf, bool strong)
 {
    for(int i = 0; i < ArraySize(g_obs); ++i)
    {
@@ -886,6 +987,15 @@ void AddOrUpdateOB(string name, datetime t, double topP, double botP,
          g_obs[i].extendTo = extendTo;
          g_obs[i].bull     = bull;
          g_obs[i].mtf      = mtf;
+         if(strong && !g_obs[i].strong)
+         {
+            g_obs[i].strong = true;
+            if(!mtf)
+            {
+               if(bull) g_cnt.obStrongBull++;
+               else     g_cnt.obStrongBear++;
+            }
+         }
          return;
       }
    }
@@ -899,7 +1009,13 @@ void AddOrUpdateOB(string name, datetime t, double topP, double botP,
    g_obs[sz].bull        = bull;
    g_obs[sz].mtf         = mtf;
    g_obs[sz].mitigated   = false;
+   g_obs[sz].strong      = strong;
    g_obs[sz].checkedUpTo = t;
+   if(strong && !mtf)
+   {
+      if(bull) g_cnt.obStrongBull++;
+      else     g_cnt.obStrongBear++;
+   }
 }
 
 void RemoveOBFromArray(string name)
@@ -1092,20 +1208,200 @@ void ClearMTFOBsArray()
 // Проверка: цена бара ([low, high]) лежит внутри активного OB нужного типа?
 bool PriceInActiveOB(double barLow, double barHigh, bool wantBull)
 {
+   return FindActiveOBIndex(barLow, barHigh, wantBull) >= 0;
+}
+
+// Возвращает индекс лучшего активного OB (приоритет: strong, затем самый свежий)
+int FindActiveOBIndex(double barLow, double barHigh, bool wantBull)
+{
+   int best = -1;
+   double bestScore = -1.0;
    for(int idx = 0; idx < ArraySize(g_obs); ++idx)
    {
       if(g_obs[idx].mitigated) continue;
       if(g_obs[idx].mtf) continue;
       if(g_obs[idx].bull != wantBull) continue;
-      // Пересечение интервалов: [barLow,barHigh] vs [botPrice,topPrice]
       if(barHigh >= g_obs[idx].botPrice && barLow <= g_obs[idx].topPrice)
-         return true;
+      {
+         double sc = (g_obs[idx].strong ? 1e12 : 0) + (double)g_obs[idx].time;
+         if(sc > bestScore) { bestScore = sc; best = idx; }
+      }
    }
-   return false;
+   return best;
+}
+
+// Premium/Discount: для BUY ждём "discount" (нижняя половина), для SELL — "premium"
+bool IsInPremDiscount(bool wantBull, double price)
+{
+   double H = 0, L = 0;
+   bool ok = false;
+   if(InpEntryPremDiscMTF && InpMTFEnable && g_mtfState.lastH.valid && g_mtfState.lastL.valid)
+   {
+      H = g_mtfState.lastH.price; L = g_mtfState.lastL.price; ok = true;
+   }
+   else if(g_state.lastH.valid && g_state.lastL.valid)
+   {
+      H = g_state.lastH.price; L = g_state.lastL.price; ok = true;
+   }
+   if(!ok) return true; // fail-open: нет данных о диапазоне → не блокируем
+   if(H <= L) return true;
+   double pos = (price - L) / (H - L);
+   double mid = InpEntryPremDiscMid;
+   double d   = MathMax(0.0, InpEntryPremDiscDelta);
+   if(wantBull) return pos < (mid - d);
+   else         return pos > (mid + d);
+}
+
+// Rejection-фитиль на закрытом баре: нижний фитиль > body для BUY, верхний — для SELL
+bool BarRejectionOK(bool wantBull, double op, double hi, double lo, double cl)
+{
+   double range = hi - lo;
+   if(range <= 0) return false;
+   double body = MathAbs(cl - op);
+   if(body <= 0) body = range * 0.05;
+   if(wantBull)
+   {
+      double lowerWick = MathMin(op, cl) - lo;
+      return lowerWick > body * 0.5 && cl >= op;
+   }
+   else
+   {
+      double upperWick = hi - MathMax(op, cl);
+      return upperWick > body * 0.5 && cl <= op;
+   }
+}
+
+// ATR на нужном баре
+double GetATR(int rates_total, int barIdx)
+{
+   if(g_atrHandle == INVALID_HANDLE) return 0.0;
+   int shift = rates_total - 1 - barIdx;
+   if(shift < 0) shift = 0;
+   double buf[];
+   if(CopyBuffer(g_atrHandle, 0, shift, 1, buf) <= 0) return 0.0;
+   return buf[0];
+}
+
+// Расчёт SL/TP для entry с учётом OB-границы и кандидатов TP
+void ComputeEntrySLTP(bool bull, int obIdx, double price, double atr,
+                      double &sl, double &tp1, double &tp2)
+{
+   sl = 0; tp1 = 0; tp2 = 0;
+   if(obIdx < 0) return;
+   double buf = MathMax(atr * InpEntrySLATRMult, _Point * 5);
+   if(bull) sl = g_obs[obIdx].botPrice - buf;
+   else     sl = g_obs[obIdx].topPrice + buf;
+
+   double cands[]; ArrayResize(cands, 0);
+
+   // Противоположные OB
+   for(int j = 0; j < ArraySize(g_obs); ++j)
+   {
+      if(g_obs[j].mitigated) continue;
+      if(g_obs[j].mtf) continue;
+      if(g_obs[j].bull == bull) continue;
+      double key = bull ? g_obs[j].botPrice : g_obs[j].topPrice;
+      if((bull && key > price) || (!bull && key < price))
+      {
+         int sz = ArraySize(cands); ArrayResize(cands, sz + 1); cands[sz] = key;
+      }
+   }
+   // VP уровни
+   if(InpEntryUseVPForTP && g_vpReady)
+   {
+      double levs[3]; levs[0] = g_pocPrice; levs[1] = g_vahPrice; levs[2] = g_valPrice;
+      for(int k = 0; k < 3; ++k)
+      {
+         if(levs[k] <= 0) continue;
+         if((bull && levs[k] > price) || (!bull && levs[k] < price))
+         {
+            int sz = ArraySize(cands); ArrayResize(cands, sz + 1); cands[sz] = levs[k];
+         }
+      }
+   }
+   // Последний свинг как глобальная цель
+   if(bull && g_state.lastH.valid && g_state.lastH.price > price)
+   { int sz = ArraySize(cands); ArrayResize(cands, sz + 1); cands[sz] = g_state.lastH.price; }
+   if(!bull && g_state.lastL.valid && g_state.lastL.price < price)
+   { int sz = ArraySize(cands); ArrayResize(cands, sz + 1); cands[sz] = g_state.lastL.price; }
+
+   int n = ArraySize(cands);
+   if(n == 0) return;
+   // Сортировка: ближайшие к цене первыми
+   for(int a = 0; a < n - 1; ++a)
+      for(int b = a + 1; b < n; ++b)
+      {
+         bool swap = bull ? (cands[a] > cands[b]) : (cands[a] < cands[b]);
+         if(swap) { double tt = cands[a]; cands[a] = cands[b]; cands[b] = tt; }
+      }
+   tp1 = cands[0];
+   for(int x = 1; x < n; ++x)
+   {
+      if(MathAbs(cands[x] - tp1) > _Point * 5) { tp2 = cands[x]; break; }
+   }
+}
+
+double ComputeRR(bool bull, double entry, double sl, double tp)
+{
+   if(sl <= 0 || tp <= 0) return 0;
+   double risk = bull ? (entry - sl) : (sl - entry);
+   double rew  = bull ? (tp - entry) : (entry - tp);
+   if(risk <= 0 || rew <= 0) return 0;
+   return rew / risk;
+}
+
+// Рисуем SL/TP пунктирами и подпись score/RR у стрелки
+void DrawEntryLevels(bool bull, datetime t, double price,
+                     double sl, double tp1, double tp2,
+                     int score, double rr)
+{
+   string dir = bull ? "u" : "d";
+   string base = InpObjPrefix + "ent_" + dir + "_" + IntegerToString((long)t);
+   datetime tEnd = t + (datetime)(PeriodSeconds() * MathMax(2, InpEntryLevelsBars));
+
+   if(InpEntryShowLevels)
+   {
+      DrawEntryLine(base + "_sl",  t, sl,  tEnd, InpEntrySLColor, STYLE_DASH);
+      DrawEntryLine(base + "_tp1", t, tp1, tEnd, InpEntryTPColor, STYLE_DOT);
+      DrawEntryLine(base + "_tp2", t, tp2, tEnd, InpEntryTPColor, STYLE_DOT);
+   }
+
+   if(InpEntryShowLabel)
+   {
+      string nm = base + "_lbl";
+      double y = bull ? price : price;
+      if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_TEXT, 0, t, y);
+      ObjectSetInteger(0, nm, OBJPROP_TIME,  t);
+      ObjectSetDouble (0, nm, OBJPROP_PRICE, y);
+      string txt = "";
+      if(score > 0) txt = StringFormat("s%d", score);
+      if(rr > 0)
+         txt = (StringLen(txt) > 0 ? txt + " " : "") + StringFormat("RR%.2f", rr);
+      ObjectSetString (0, nm, OBJPROP_TEXT, txt);
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, bull ? InpEntryUpColor : InpEntryDnColor);
+      ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, nm, OBJPROP_ANCHOR, bull ? ANCHOR_UPPER : ANCHOR_LOWER);
+   }
+}
+
+void DrawEntryLine(string nm, datetime t1, double price, datetime t2, color clr, int style)
+{
+   if(price <= 0) { if(ObjectFind(0, nm) >= 0) ObjectDelete(0, nm); return; }
+   if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_TREND, 0, t1, price, t2, price);
+   ObjectSetInteger(0, nm, OBJPROP_TIME,  0, t1);
+   ObjectSetDouble (0, nm, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, nm, OBJPROP_TIME,  1, t2);
+   ObjectSetDouble (0, nm, OBJPROP_PRICE, 1, price);
+   ObjectSetInteger(0, nm, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, nm, OBJPROP_STYLE, style);
+   ObjectSetInteger(0, nm, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
 }
 
 // Главный детектор entry-сигнала на закрытом баре i
-void DetectEntry(int i, const datetime &time[],
+void DetectEntry(int i, int rates_total,
+                 const datetime &time[],
                  const double &open[], const double &high[],
                  const double &low[],  const double &close[])
 {
@@ -1115,52 +1411,194 @@ void DetectEntry(int i, const datetime &time[],
 
    long recencyTs = (long)PeriodSeconds(_Period) * (long)InpEntryRecencyBars;
    datetime t = time[i];
+   double price = close[i];
+   double atr   = GetATR(rates_total, i);
 
-   //--- Проверка BULL entry ---
-   bool bullOk = true;
-   if(InpEntryNeedTrend && g_state.trend != 1) bullOk = false;
-   if(bullOk && InpEntryNeedMTF && InpMTFEnable && g_mtfState.trend != 1) bullOk = false;
-   if(bullOk && InpEntryNeedVolume && BufHighVolUp[i] == EMPTY_VALUE) bullOk = false;
-   if(bullOk && InpEntryNeedOB && !PriceInActiveOB(low[i], high[i], true)) bullOk = false;
-   if(bullOk && InpEntryNeedSweep)
+   // ===== BUY =====
    {
-      if(g_lastSweepLowTime == 0 || (long)(t - g_lastSweepLowTime) > recencyTs)
-         bullOk = false;
-   }
-   if(bullOk && InpEntryNeedStruct)
-   {
-      if(g_lastBullStructTime == 0 || (long)(t - g_lastBullStructTime) > recencyTs)
-         bullOk = false;
-   }
-   if(bullOk)
-   {
-      BufEntryUp[i] = low[i];
-      g_cnt.entryUp++;
-      EntryAlert("BUY entry", t);
-      return; // не даём bull и bear совпасть
+      bool trendOk    = (g_state.trend == 1);
+      bool mtfOk      = (!InpMTFEnable) || (g_mtfState.trend == 1);
+      bool volOk      = (BufHighVolUp[i] != EMPTY_VALUE);
+      int  obIdx      = FindActiveOBIndex(low[i], high[i], true);
+      bool obOk       = (obIdx >= 0);
+      bool strongObOk = (obIdx >= 0 && g_obs[obIdx].strong);
+      bool sweepOk    = (g_lastSweepLowTime != 0 && (long)(t - g_lastSweepLowTime) <= recencyTs);
+      bool structOk   = (g_lastBullStructTime != 0 && (long)(t - g_lastBullStructTime) <= recencyTs);
+      bool pdOk       = IsInPremDiscount(true, price);
+      bool rejectOk   = BarRejectionOK(true, open[i], high[i], low[i], close[i]);
+      bool vpCnf      = false;
+      if(g_vpReady && atr > 0)
+      {
+         double dPoc = (g_pocPrice > 0) ? MathAbs(price - g_pocPrice) : 1e18;
+         double dVa  = MathMin((g_vahPrice > 0) ? MathAbs(price - g_vahPrice) : 1e18,
+                               (g_valPrice > 0) ? MathAbs(price - g_valPrice) : 1e18);
+         vpCnf = MathMin(dPoc, dVa) <= atr * 0.30;
+      }
+
+      double sl = 0, tp1 = 0, tp2 = 0, rr = 0;
+      if(obOk) ComputeEntrySLTP(true, obIdx, price, atr, sl, tp1, tp2);
+      if(sl > 0 && tp1 > 0) rr = ComputeRR(true, price, sl, tp1);
+      bool rrOk = (InpEntryMinRR <= 0) || (rr >= InpEntryMinRR);
+
+      bool coolOk = true;
+      if(InpEntryCooldownBars > 0 && g_lastEntryUpTime != 0 &&
+         (long)(t - g_lastEntryUpTime) < (long)PeriodSeconds(_Period) * InpEntryCooldownBars)
+         coolOk = false;
+      if(coolOk && InpEntryMinDistATR > 0 && atr > 0 && g_lastEntryUpPrice > 0 &&
+         MathAbs(price - g_lastEntryUpPrice) < atr * InpEntryMinDistATR)
+         coolOk = false;
+
+      int  score = 0;
+      bool fire  = false;
+
+      if(InpEntryUseScore)
+      {
+         if(trendOk)               score += InpEntryWeightTrend;
+         if(mtfOk && InpMTFEnable) score += InpEntryWeightMTF;
+         if(obOk)                  score += InpEntryWeightOB;
+         if(strongObOk)            score += InpEntryWeightStrongOB;
+         if(volOk)                 score += InpEntryWeightVolume;
+         if(sweepOk)               score += InpEntryWeightSweep;
+         if(structOk)              score += InpEntryWeightStruct;
+         if(pdOk)                  score += InpEntryWeightPremDisc;
+         if(rrOk && rr > 0)        score += InpEntryWeightRR;
+         if(vpCnf)                 score += InpEntryWeightVPCnflu;
+         if(rejectOk)              score += InpEntryWeightReject;
+         fire = (score >= InpEntryMinScore) && coolOk;
+      }
+      else
+      {
+         bool ok = true;
+         if(InpEntryNeedTrend && !trendOk) ok = false;
+         if(ok && InpEntryNeedMTF && InpMTFEnable && !mtfOk) ok = false;
+         if(ok && InpEntryNeedVolume && !volOk) ok = false;
+         if(ok && InpEntryNeedOB && !obOk)      ok = false;
+         if(ok && InpEntryNeedSweep && !sweepOk) ok = false;
+         if(ok && InpEntryNeedStruct && !structOk) ok = false;
+         fire = ok && coolOk;
+         score = (trendOk?1:0) + (mtfOk?1:0) + (obOk?1:0) + (strongObOk?1:0) +
+                 (volOk?1:0) + (sweepOk?1:0) + (structOk?1:0) + (pdOk?1:0) +
+                 (rejectOk?1:0) + (vpCnf?1:0);
+      }
+
+      // Жёсткие гейты применяются ВСЕГДА (и в score, и в AND-режиме)
+      if(fire && InpEntryNeedPremDisc && !pdOk) fire = false;
+      if(fire && InpEntryNeedStrongOB && !strongObOk) fire = false;
+      if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
+      if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
+      // В score-режиме чекбоксы тренд/OB/etc можно использовать как hard-gate
+      if(fire && InpEntryUseScore)
+      {
+         if(InpEntryNeedTrend  && !trendOk)               fire = false;
+         if(InpEntryNeedMTF    && InpMTFEnable && !mtfOk) fire = false;
+         if(InpEntryNeedOB     && !obOk)                  fire = false;
+         if(InpEntryNeedVolume && !volOk)                 fire = false;
+         if(InpEntryNeedSweep  && !sweepOk)               fire = false;
+         if(InpEntryNeedStruct && !structOk)              fire = false;
+      }
+
+      if(fire)
+      {
+         BufEntryUp[i] = low[i];
+         g_cnt.entryUp++;
+         DrawEntryLevels(true, t, price, sl, tp1, tp2, score, rr);
+         g_lastEntryUpTime  = t;
+         g_lastEntryUpPrice = price;
+         EntryAlert("BUY entry", t);
+         return;
+      }
    }
 
-   //--- Проверка BEAR entry ---
-   bool bearOk = true;
-   if(InpEntryNeedTrend && g_state.trend != -1) bearOk = false;
-   if(bearOk && InpEntryNeedMTF && InpMTFEnable && g_mtfState.trend != -1) bearOk = false;
-   if(bearOk && InpEntryNeedVolume && BufHighVolDn[i] == EMPTY_VALUE) bearOk = false;
-   if(bearOk && InpEntryNeedOB && !PriceInActiveOB(low[i], high[i], false)) bearOk = false;
-   if(bearOk && InpEntryNeedSweep)
+   // ===== SELL =====
    {
-      if(g_lastSweepHighTime == 0 || (long)(t - g_lastSweepHighTime) > recencyTs)
-         bearOk = false;
-   }
-   if(bearOk && InpEntryNeedStruct)
-   {
-      if(g_lastBearStructTime == 0 || (long)(t - g_lastBearStructTime) > recencyTs)
-         bearOk = false;
-   }
-   if(bearOk)
-   {
-      BufEntryDn[i] = high[i];
-      g_cnt.entryDn++;
-      EntryAlert("SELL entry", t);
+      bool trendOk    = (g_state.trend == -1);
+      bool mtfOk      = (!InpMTFEnable) || (g_mtfState.trend == -1);
+      bool volOk      = (BufHighVolDn[i] != EMPTY_VALUE);
+      int  obIdx      = FindActiveOBIndex(low[i], high[i], false);
+      bool obOk       = (obIdx >= 0);
+      bool strongObOk = (obIdx >= 0 && g_obs[obIdx].strong);
+      bool sweepOk    = (g_lastSweepHighTime != 0 && (long)(t - g_lastSweepHighTime) <= recencyTs);
+      bool structOk   = (g_lastBearStructTime != 0 && (long)(t - g_lastBearStructTime) <= recencyTs);
+      bool pdOk       = IsInPremDiscount(false, price);
+      bool rejectOk   = BarRejectionOK(false, open[i], high[i], low[i], close[i]);
+      bool vpCnf      = false;
+      if(g_vpReady && atr > 0)
+      {
+         double dPoc = (g_pocPrice > 0) ? MathAbs(price - g_pocPrice) : 1e18;
+         double dVa  = MathMin((g_vahPrice > 0) ? MathAbs(price - g_vahPrice) : 1e18,
+                               (g_valPrice > 0) ? MathAbs(price - g_valPrice) : 1e18);
+         vpCnf = MathMin(dPoc, dVa) <= atr * 0.30;
+      }
+
+      double sl = 0, tp1 = 0, tp2 = 0, rr = 0;
+      if(obOk) ComputeEntrySLTP(false, obIdx, price, atr, sl, tp1, tp2);
+      if(sl > 0 && tp1 > 0) rr = ComputeRR(false, price, sl, tp1);
+      bool rrOk = (InpEntryMinRR <= 0) || (rr >= InpEntryMinRR);
+
+      bool coolOk = true;
+      if(InpEntryCooldownBars > 0 && g_lastEntryDnTime != 0 &&
+         (long)(t - g_lastEntryDnTime) < (long)PeriodSeconds(_Period) * InpEntryCooldownBars)
+         coolOk = false;
+      if(coolOk && InpEntryMinDistATR > 0 && atr > 0 && g_lastEntryDnPrice > 0 &&
+         MathAbs(price - g_lastEntryDnPrice) < atr * InpEntryMinDistATR)
+         coolOk = false;
+
+      int  score = 0;
+      bool fire  = false;
+
+      if(InpEntryUseScore)
+      {
+         if(trendOk)               score += InpEntryWeightTrend;
+         if(mtfOk && InpMTFEnable) score += InpEntryWeightMTF;
+         if(obOk)                  score += InpEntryWeightOB;
+         if(strongObOk)            score += InpEntryWeightStrongOB;
+         if(volOk)                 score += InpEntryWeightVolume;
+         if(sweepOk)               score += InpEntryWeightSweep;
+         if(structOk)              score += InpEntryWeightStruct;
+         if(pdOk)                  score += InpEntryWeightPremDisc;
+         if(rrOk && rr > 0)        score += InpEntryWeightRR;
+         if(vpCnf)                 score += InpEntryWeightVPCnflu;
+         if(rejectOk)              score += InpEntryWeightReject;
+         fire = (score >= InpEntryMinScore) && coolOk;
+      }
+      else
+      {
+         bool ok = true;
+         if(InpEntryNeedTrend && !trendOk) ok = false;
+         if(ok && InpEntryNeedMTF && InpMTFEnable && !mtfOk) ok = false;
+         if(ok && InpEntryNeedVolume && !volOk) ok = false;
+         if(ok && InpEntryNeedOB && !obOk)      ok = false;
+         if(ok && InpEntryNeedSweep && !sweepOk) ok = false;
+         if(ok && InpEntryNeedStruct && !structOk) ok = false;
+         fire = ok && coolOk;
+         score = (trendOk?1:0) + (mtfOk?1:0) + (obOk?1:0) + (strongObOk?1:0) +
+                 (volOk?1:0) + (sweepOk?1:0) + (structOk?1:0) + (pdOk?1:0) +
+                 (rejectOk?1:0) + (vpCnf?1:0);
+      }
+
+      if(fire && InpEntryNeedPremDisc && !pdOk) fire = false;
+      if(fire && InpEntryNeedStrongOB && !strongObOk) fire = false;
+      if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
+      if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
+      if(fire && InpEntryUseScore)
+      {
+         if(InpEntryNeedTrend  && !trendOk)               fire = false;
+         if(InpEntryNeedMTF    && InpMTFEnable && !mtfOk) fire = false;
+         if(InpEntryNeedOB     && !obOk)                  fire = false;
+         if(InpEntryNeedVolume && !volOk)                 fire = false;
+         if(InpEntryNeedSweep  && !sweepOk)               fire = false;
+         if(InpEntryNeedStruct && !structOk)              fire = false;
+      }
+
+      if(fire)
+      {
+         BufEntryDn[i] = high[i];
+         g_cnt.entryDn++;
+         DrawEntryLevels(false, t, price, sl, tp1, tp2, score, rr);
+         g_lastEntryDnTime  = t;
+         g_lastEntryDnPrice = price;
+         EntryAlert("SELL entry", t);
+      }
    }
 }
 
@@ -1272,8 +1710,8 @@ void DashboardUpdate()
    }
 
    DashLineSet(row++, "─ Зоны ─",                                                              InpDashAccent);
-   DashLineSet(row++, StringFormat("OB+   active %d  mit %d", g_cnt.obBullActive, g_cnt.obBullMit), InpDashTextColor);
-   DashLineSet(row++, StringFormat("OB-   active %d  mit %d", g_cnt.obBearActive, g_cnt.obBearMit), InpDashTextColor);
+   DashLineSet(row++, StringFormat("OB+   active %d  mit %d  strong %d", g_cnt.obBullActive, g_cnt.obBullMit, g_cnt.obStrongBull), InpDashTextColor);
+   DashLineSet(row++, StringFormat("OB-   active %d  mit %d  strong %d", g_cnt.obBearActive, g_cnt.obBearMit, g_cnt.obStrongBear), InpDashTextColor);
    DashLineSet(row++, StringFormat("FVG   +%d  / -%d",        g_cnt.fvgBull,      g_cnt.fvgBear),   InpDashTextColor);
 
    DashLineSet(row++, "─ Объём ─",                                                             InpDashAccent);
@@ -1283,6 +1721,19 @@ void DashboardUpdate()
    {
       DashLineSet(row++, "─ Entry signals ─",                                                   InpDashAccent);
       DashLineSet(row++, StringFormat("BUY  %d   /   SELL  %d", g_cnt.entryUp, g_cnt.entryDn),  InpDashTextColor);
+      string mode = InpEntryUseScore
+                    ? StringFormat("score >= %d", InpEntryMinScore)
+                    : "AND-gates";
+      string flt = "";
+      if(InpEntryNeedPremDisc) flt += "PD ";
+      if(InpEntryNeedStrongOB) flt += "strOB ";
+      if(InpEntryNeedReject)   flt += "rej ";
+      if(InpEntryNeedRR || InpEntryMinRR > 0)
+         flt += StringFormat("RR>=%.1f ", InpEntryMinRR);
+      if(InpEntryCooldownBars > 0) flt += StringFormat("cd%d ", InpEntryCooldownBars);
+      DashLineSet(row++, "Mode: " + mode,                                                       InpDashTextColor);
+      if(StringLen(flt) > 0)
+         DashLineSet(row++, "Filt: " + flt,                                                     InpDashTextColor);
    }
 
    if(InpVPEnable)
@@ -1293,7 +1744,7 @@ void DashboardUpdate()
    }
 
    // Скрываем «лишние» строки от прошлых конфигураций (если стало меньше rows)
-   for(int extra = row; extra < 30; ++extra)
+   for(int extra = row; extra < 40; ++extra)
    {
       string nm = InpObjPrefix + "dash_l" + IntegerToString(extra);
       if(ObjectFind(0, nm) >= 0)
@@ -1461,15 +1912,20 @@ void BuildVolumeProfile()
    }
 
    // POC / VAH / VAL линии
+   double pocPrice = pmin + (pocIdx + 0.5) * rowH;
+   double vahPrice = pmin + (vaHigh + 1) * rowH;
+   double valPrice = pmin + vaLow * rowH;
+   g_pocPrice = pocPrice;
+   g_vahPrice = vahPrice;
+   g_valPrice = valPrice;
+   g_vpReady  = true;
+
    if(InpVPShowPoc)
    {
-      double pocPrice = pmin + (pocIdx + 0.5) * rowH;
       DrawVPLine("vp_poc", pocPrice, InpVPPocColor, STYLE_DOT,  "POC " + DoubleToString(pocPrice, _Digits));
    }
    if(InpVPShowVa)
    {
-      double vahPrice = pmin + (vaHigh + 1) * rowH;
-      double valPrice = pmin + vaLow * rowH;
       DrawVPLine("vp_vah", vahPrice, InpVPVaColor, STYLE_DASH, "VAH " + DoubleToString(vahPrice, _Digits));
       DrawVPLine("vp_val", valPrice, InpVPVaColor, STYLE_DASH, "VAL " + DoubleToString(valPrice, _Digits));
    }
