@@ -8,8 +8,8 @@
 #property version   "1.10"
 #property strict
 #property indicator_chart_window
-#property indicator_buffers 2
-#property indicator_plots   2
+#property indicator_buffers 4
+#property indicator_plots   4
 
 //--- Plots: стрелки над/под высоко-объёмными барами
 #property indicator_label1  "HighVolUp"
@@ -21,6 +21,17 @@
 #property indicator_type2   DRAW_ARROW
 #property indicator_color2  clrOrange
 #property indicator_width2  2
+
+//--- Plots: ENTRY SIGNAL стрелки (совпадение всех условий)
+#property indicator_label3  "EntryUp"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  clrLime
+#property indicator_width3  4
+
+#property indicator_label4  "EntryDn"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  clrRed
+#property indicator_width4  4
 
 //+==================================================================+
 //| ВХОДНЫЕ ПАРАМЕТРЫ                                                 |
@@ -102,6 +113,23 @@ input bool             InpVPShowVa      = true;
 input double           InpVPValueArea   = 0.70;           // Доля объёма для Value Area (0.7 = 70%)
 input bool             InpVPRightSide   = true;           // Гистограмма справа
 
+input group "=== Entry signals (стрелки точки входа) ==="
+input bool     InpEntryEnable        = true;        // Показывать стрелки точки входа
+input bool     InpEntryNeedTrend     = true;        // Требовать совпадения с трендом текущ. ТФ
+input bool     InpEntryNeedMTF       = false;       // Требовать совпадения с трендом MTF
+input bool     InpEntryNeedOB        = true;        // Цена должна быть внутри активного OB
+input bool     InpEntryNeedVolume    = true;        // Бар должен быть громким (того же цвета)
+input bool     InpEntryNeedSweep     = false;       // Недавний sweep в обратную сторону
+input bool     InpEntryNeedStruct    = false;       // Недавний BOS/CHoCH в нужную сторону
+input int      InpEntryRecencyBars   = 5;           // Окно «недавности» (баров) для sweep/struct
+input color    InpEntryUpColor       = clrLime;     // Цвет стрелки покупки
+input color    InpEntryDnColor       = clrRed;      // Цвет стрелки продажи
+input int      InpEntryUpArrow       = 233;         // Wingdings код стрелки вверх (233=▲)
+input int      InpEntryDnArrow       = 234;         // Wingdings код стрелки вниз (234=▼)
+input int      InpEntryArrowWidth    = 4;           // Толщина стрелки
+input int      InpEntryArrowShift    = 30;          // Смещение в пикселях от свечи
+input bool     InpEntryAlert         = false;       // Алерт при появлении entry-сигнала
+
 input group "=== Производительность ==="
 input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
 input bool     InpHeavyOnNewBarOnly= true;        // Тяжёлые задачи (mitigation/dashboard/VP) только на новом баре
@@ -117,6 +145,8 @@ input bool     InpAlertOnSweep     = false;
 //+==================================================================+
 double BufHighVolUp[];
 double BufHighVolDn[];
+double BufEntryUp[];
+double BufEntryDn[];
 
 struct SwingPoint
 {
@@ -176,6 +206,7 @@ struct Counters
    int swingsHH, swingsHL, swingsLH, swingsLL;
    int mtfBosBull, mtfBosBear;
    int mtfChochBull, mtfChochBear;
+   int entryUp, entryDn;
 };
 
 SwingState g_state;
@@ -189,6 +220,11 @@ DrawCtx    g_ctx;
 DrawCtx    g_ctxMTF;
 datetime   g_lastBarSeen  = 0;
 bool       g_dashCreated  = false;
+// Время последних структурных событий (для проверки «недавности» в Entry)
+datetime   g_lastSweepHighTime = 0;  // была снята ликвидность с верха
+datetime   g_lastSweepLowTime  = 0;  // была снята ликвидность с низа
+datetime   g_lastBullStructTime = 0; // последний BOS/CHoCH вверх
+datetime   g_lastBearStructTime = 0; // последний BOS/CHoCH вниз
 
 //+==================================================================+
 //| OnInit / OnDeinit                                                 |
@@ -197,6 +233,8 @@ int OnInit()
 {
    SetIndexBuffer(0, BufHighVolUp, INDICATOR_DATA);
    SetIndexBuffer(1, BufHighVolDn, INDICATOR_DATA);
+   SetIndexBuffer(2, BufEntryUp,   INDICATOR_DATA);
+   SetIndexBuffer(3, BufEntryDn,   INDICATOR_DATA);
 
    PlotIndexSetInteger(0, PLOT_ARROW, 234);
    PlotIndexSetInteger(1, PLOT_ARROW, 233);
@@ -204,8 +242,23 @@ int OnInit()
    PlotIndexSetDouble (1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetInteger(0, PLOT_ARROW_SHIFT, -10);
    PlotIndexSetInteger(1, PLOT_ARROW_SHIFT,  10);
+
+   //--- Entry signal arrows
+   PlotIndexSetInteger(2, PLOT_ARROW, InpEntryUpArrow);
+   PlotIndexSetInteger(3, PLOT_ARROW, InpEntryDnArrow);
+   PlotIndexSetDouble (2, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble (3, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT,  InpEntryArrowShift);
+   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -InpEntryArrowShift);
+   PlotIndexSetInteger(2, PLOT_LINE_COLOR, 0, InpEntryUpColor);
+   PlotIndexSetInteger(3, PLOT_LINE_COLOR, 0, InpEntryDnColor);
+   PlotIndexSetInteger(2, PLOT_LINE_WIDTH, InpEntryArrowWidth);
+   PlotIndexSetInteger(3, PLOT_LINE_WIDTH, InpEntryArrowWidth);
+
    ArraySetAsSeries(BufHighVolUp, false);
    ArraySetAsSeries(BufHighVolDn, false);
+   ArraySetAsSeries(BufEntryUp,   false);
+   ArraySetAsSeries(BufEntryDn,   false);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "SmartMoney+Volume MTF");
 
@@ -217,6 +270,10 @@ int OnInit()
    g_mtfLastTime = 0;
    g_lastVPTime  = 0;
    g_lastVPPeriod = PERIOD_CURRENT;
+   g_lastSweepHighTime = 0;
+   g_lastSweepLowTime  = 0;
+   g_lastBullStructTime = 0;
+   g_lastBearStructTime = 0;
 
    ClearAllObjects();
    if(InpDashEnable) DashboardCreate();
@@ -313,9 +370,15 @@ int OnCalculate(const int rates_total,
    {
       ArrayInitialize(BufHighVolUp, EMPTY_VALUE);
       ArrayInitialize(BufHighVolDn, EMPTY_VALUE);
+      ArrayInitialize(BufEntryUp,   EMPTY_VALUE);
+      ArrayInitialize(BufEntryDn,   EMPTY_VALUE);
       ResetState(g_state);
       ResetCounters();
       ArrayResize(g_obs, 0);
+      g_lastSweepHighTime = 0;
+      g_lastSweepLowTime  = 0;
+      g_lastBullStructTime = 0;
+      g_lastBearStructTime = 0;
       ClearAllObjects();
       g_dashCreated = false;
       if(InpDashEnable) { DashboardCreate(); DashboardLayout(); g_dashCreated = true; }
@@ -348,6 +411,8 @@ int OnCalculate(const int rates_total,
       DetectSwingGeneric(i, InpSwingLength,
                          time, open, high, low, close,
                          g_state, g_ctx, _Period, InpOBExtendBars, InpOBMaxCount);
+      if(InpEntryEnable)
+         DetectEntry(i, time, open, high, low, close);
    }
 
    //--- Незакрытые/неподтверждённые бары: только громкие свечи (по желанию)
@@ -355,6 +420,8 @@ int OnCalculate(const int rates_total,
    {
       BufHighVolUp[i] = EMPTY_VALUE;
       BufHighVolDn[i] = EMPTY_VALUE;
+      BufEntryUp[i]   = EMPTY_VALUE;
+      BufEntryDn[i]   = EMPTY_VALUE;
       if(InpProcessUnclosed)
          ProcessVolume(i, rates_total, time, open, close, high, low, tick_volume, volume);
    }
@@ -607,7 +674,7 @@ void HandleSwingHigh(int i, const datetime &time[],
                         time[i], state.lastH.price, "BOS", true, ctx);
       state.trend = 1;
       AlertStructure("BOS bull", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfBosBull++; else g_cnt.bosBull++;
+      if(ctx.isMTF) g_cnt.mtfBosBull++; else { g_cnt.bosBull++; g_lastBullStructTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, true, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -619,7 +686,7 @@ void HandleSwingHigh(int i, const datetime &time[],
                         time[i], state.lastH.price, "CHoCH", true, ctx);
       state.trend = 1;
       AlertStructure("CHoCH bull", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfChochBull++; else g_cnt.chochBull++;
+      if(ctx.isMTF) g_cnt.mtfChochBull++; else { g_cnt.chochBull++; g_lastBullStructTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, true, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -632,6 +699,7 @@ void HandleSwingHigh(int i, const datetime &time[],
       DrawSweep(time[i], high[i], true);
       AlertSweep("Sweep high", time[i]);
       g_cnt.sweepBull++;
+      g_lastSweepHighTime = time[i];
    }
 
    state.prevH = state.lastH;
@@ -659,7 +727,7 @@ void HandleSwingLow(int i, const datetime &time[],
                         time[i], state.lastL.price, "BOS", false, ctx);
       state.trend = -1;
       AlertStructure("BOS bear", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfBosBear++; else g_cnt.bosBear++;
+      if(ctx.isMTF) g_cnt.mtfBosBear++; else { g_cnt.bosBear++; g_lastBearStructTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, false, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -671,7 +739,7 @@ void HandleSwingLow(int i, const datetime &time[],
                         time[i], state.lastL.price, "CHoCH", false, ctx);
       state.trend = -1;
       AlertStructure("CHoCH bear", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfChochBear++; else g_cnt.chochBear++;
+      if(ctx.isMTF) g_cnt.mtfChochBear++; else { g_cnt.chochBear++; g_lastBearStructTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, false, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -683,6 +751,7 @@ void HandleSwingLow(int i, const datetime &time[],
       DrawSweep(time[i], low[i], false);
       AlertSweep("Sweep low", time[i]);
       g_cnt.sweepBear++;
+      g_lastSweepLowTime = time[i];
    }
 
    state.prevL = state.lastL;
@@ -1017,6 +1086,92 @@ void ClearMTFOBsArray()
 }
 
 //+==================================================================+
+//| ENTRY SIGNALS                                                      |
+//+==================================================================+
+
+// Проверка: цена бара ([low, high]) лежит внутри активного OB нужного типа?
+bool PriceInActiveOB(double barLow, double barHigh, bool wantBull)
+{
+   for(int idx = 0; idx < ArraySize(g_obs); ++idx)
+   {
+      if(g_obs[idx].mitigated) continue;
+      if(g_obs[idx].mtf) continue;
+      if(g_obs[idx].bull != wantBull) continue;
+      // Пересечение интервалов: [barLow,barHigh] vs [botPrice,topPrice]
+      if(barHigh >= g_obs[idx].botPrice && barLow <= g_obs[idx].topPrice)
+         return true;
+   }
+   return false;
+}
+
+// Главный детектор entry-сигнала на закрытом баре i
+void DetectEntry(int i, const datetime &time[],
+                 const double &open[], const double &high[],
+                 const double &low[],  const double &close[])
+{
+   BufEntryUp[i] = EMPTY_VALUE;
+   BufEntryDn[i] = EMPTY_VALUE;
+   if(!InpEntryEnable) return;
+
+   long recencyTs = (long)PeriodSeconds(_Period) * (long)InpEntryRecencyBars;
+   datetime t = time[i];
+
+   //--- Проверка BULL entry ---
+   bool bullOk = true;
+   if(InpEntryNeedTrend && g_state.trend != 1) bullOk = false;
+   if(bullOk && InpEntryNeedMTF && InpMTFEnable && g_mtfState.trend != 1) bullOk = false;
+   if(bullOk && InpEntryNeedVolume && BufHighVolUp[i] == EMPTY_VALUE) bullOk = false;
+   if(bullOk && InpEntryNeedOB && !PriceInActiveOB(low[i], high[i], true)) bullOk = false;
+   if(bullOk && InpEntryNeedSweep)
+   {
+      if(g_lastSweepLowTime == 0 || (long)(t - g_lastSweepLowTime) > recencyTs)
+         bullOk = false;
+   }
+   if(bullOk && InpEntryNeedStruct)
+   {
+      if(g_lastBullStructTime == 0 || (long)(t - g_lastBullStructTime) > recencyTs)
+         bullOk = false;
+   }
+   if(bullOk)
+   {
+      BufEntryUp[i] = low[i];
+      g_cnt.entryUp++;
+      EntryAlert("BUY entry", t);
+      return; // не даём bull и bear совпасть
+   }
+
+   //--- Проверка BEAR entry ---
+   bool bearOk = true;
+   if(InpEntryNeedTrend && g_state.trend != -1) bearOk = false;
+   if(bearOk && InpEntryNeedMTF && InpMTFEnable && g_mtfState.trend != -1) bearOk = false;
+   if(bearOk && InpEntryNeedVolume && BufHighVolDn[i] == EMPTY_VALUE) bearOk = false;
+   if(bearOk && InpEntryNeedOB && !PriceInActiveOB(low[i], high[i], false)) bearOk = false;
+   if(bearOk && InpEntryNeedSweep)
+   {
+      if(g_lastSweepHighTime == 0 || (long)(t - g_lastSweepHighTime) > recencyTs)
+         bearOk = false;
+   }
+   if(bearOk && InpEntryNeedStruct)
+   {
+      if(g_lastBearStructTime == 0 || (long)(t - g_lastBearStructTime) > recencyTs)
+         bearOk = false;
+   }
+   if(bearOk)
+   {
+      BufEntryDn[i] = high[i];
+      g_cnt.entryDn++;
+      EntryAlert("SELL entry", t);
+   }
+}
+
+void EntryAlert(string what, datetime t)
+{
+   if(!InpEntryAlert) return;
+   if(TimeCurrent() - t > PeriodSeconds() * 2) return;
+   Alert(_Symbol, " ", EnumToString(_Period), " ", what, " @ ", TimeToString(t, TIME_DATE|TIME_MINUTES));
+}
+
+//+==================================================================+
 //| DASHBOARD                                                          |
 //+==================================================================+
 void DashboardCreate()
@@ -1123,6 +1278,12 @@ void DashboardUpdate()
 
    DashLineSet(row++, "─ Объём ─",                                                             InpDashAccent);
    DashLineSet(row++, StringFormat("Громких +%d / -%d  (×%.2f)", g_cnt.hivolUp, g_cnt.hivolDn, InpVolumeMultiplier), InpDashTextColor);
+
+   if(InpEntryEnable)
+   {
+      DashLineSet(row++, "─ Entry signals ─",                                                   InpDashAccent);
+      DashLineSet(row++, StringFormat("BUY  %d   /   SELL  %d", g_cnt.entryUp, g_cnt.entryDn),  InpDashTextColor);
+   }
 
    if(InpVPEnable)
    {
