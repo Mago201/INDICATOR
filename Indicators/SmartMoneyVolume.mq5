@@ -102,6 +102,11 @@ input bool             InpVPShowVa      = true;
 input double           InpVPValueArea   = 0.70;           // Доля объёма для Value Area (0.7 = 70%)
 input bool             InpVPRightSide   = true;           // Гистограмма справа
 
+input group "=== Производительность ==="
+input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
+input bool     InpHeavyOnNewBarOnly= true;        // Тяжёлые задачи (mitigation/dashboard/VP) только на новом баре
+input bool     InpProcessUnclosed  = false;       // Обрабатывать объёмы на текущем (незакрытом) баре
+
 input group "=== Прочее ==="
 input string   InpObjPrefix        = "SMV_";
 input bool     InpAlertOnBOS       = false;
@@ -156,6 +161,7 @@ struct OBData
    bool     bull;
    bool     mitigated;
    bool     mtf;
+   datetime checkedUpTo;  // время последнего проверенного бара (для инкремент. mitigation)
 };
 
 struct Counters
@@ -181,6 +187,8 @@ OBData     g_obs[];
 Counters   g_cnt;
 DrawCtx    g_ctx;
 DrawCtx    g_ctxMTF;
+datetime   g_lastBarSeen  = 0;
+bool       g_dashCreated  = false;
 
 //+==================================================================+
 //| OnInit / OnDeinit                                                 |
@@ -295,6 +303,11 @@ int OnCalculate(const int rates_total,
 {
    if(rates_total < InpSwingLength * 2 + 5) return(0);
 
+   // Признак нового бара по текущему ТФ
+   bool isNewBar = (time[rates_total - 1] != g_lastBarSeen);
+   g_lastBarSeen = time[rates_total - 1];
+
+   bool firstScan = false;
    int start;
    if(prev_calculated <= 0)
    {
@@ -304,12 +317,23 @@ int OnCalculate(const int rates_total,
       ResetCounters();
       ArrayResize(g_obs, 0);
       ClearAllObjects();
-      if(InpDashEnable) DashboardCreate();
+      g_dashCreated = false;
+      if(InpDashEnable) { DashboardCreate(); DashboardLayout(); g_dashCreated = true; }
       start = InpSwingLength;
+      firstScan = true;
+      isNewBar = true;
    }
    else
    {
       start = prev_calculated - 1;
+      if(start < InpSwingLength) start = InpSwingLength;
+   }
+
+   // Лимит глубины истории — не сканируем всё за всё время
+   if(firstScan && InpHistoryBars > 0)
+   {
+      int desiredStart = rates_total - InpHistoryBars;
+      if(desiredStart > start) start = desiredStart;
       if(start < InpSwingLength) start = InpSwingLength;
    }
 
@@ -326,32 +350,35 @@ int OnCalculate(const int rates_total,
                          g_state, g_ctx, _Period, InpOBExtendBars, InpOBMaxCount);
    }
 
-   //--- Незакрытые/неподтверждённые бары: только громкие свечи
+   //--- Незакрытые/неподтверждённые бары: только громкие свечи (по желанию)
    for(int i = last_confirmable + 1; i < rates_total; ++i)
    {
       BufHighVolUp[i] = EMPTY_VALUE;
       BufHighVolDn[i] = EMPTY_VALUE;
-      ProcessVolume(i, rates_total, time, open, close, high, low, tick_volume, volume);
+      if(InpProcessUnclosed)
+         ProcessVolume(i, rates_total, time, open, close, high, low, tick_volume, volume);
    }
 
-   //--- Обновление mitigation для существующих OB
-   if(InpShowOB)
+   //--- Тяжёлые задачи только при необходимости
+   bool runHeavy = (!InpHeavyOnNewBarOnly) || isNewBar || firstScan;
+
+   if(runHeavy && InpShowOB)
       UpdateOBMitigation(time, high, low, rates_total);
 
-   //--- MTF: пересчитываем при появлении нового бара старшего ТФ
+   //--- MTF: пересчитываем только при появлении нового бара старшего ТФ
    if(InpMTFEnable)
    {
       datetime curMTF = iTime(_Symbol, InpMTFPeriod, 0);
-      if(curMTF != g_mtfLastTime)
+      if(curMTF != 0 && curMTF != g_mtfLastTime)
       {
          ProcessMTF();
          g_mtfLastTime = curMTF;
       }
    }
 
-   //--- Volume Profile: пересчёт при появлении нового бара
+   //--- Volume Profile: на новом баре или при смене параметров
    datetime nowBar = time[rates_total - 1];
-   if(InpVPEnable && (nowBar != g_lastVPTime || InpVPTimeframe != g_lastVPPeriod))
+   if(InpVPEnable && runHeavy && (nowBar != g_lastVPTime || InpVPTimeframe != g_lastVPPeriod))
    {
       BuildVolumeProfile();
       g_lastVPTime   = nowBar;
@@ -363,11 +390,23 @@ int OnCalculate(const int rates_total,
       g_lastVPTime = 0;
    }
 
-   //--- Dashboard
+   //--- Dashboard: пересоздаём только при включении/первом запуске,
+   //--- иначе обновляем текст метк (быстро)
    if(InpDashEnable)
-      DashboardUpdate();
-   else
+   {
+      if(!g_dashCreated)
+      {
+         DashboardCreate();
+         DashboardLayout();
+         g_dashCreated = true;
+      }
+      if(runHeavy) DashboardUpdate();
+   }
+   else if(g_dashCreated)
+   {
       ClearDashboard();
+      g_dashCreated = false;
+   }
 
    return(rates_total);
 }
@@ -783,14 +822,15 @@ void AddOrUpdateOB(string name, datetime t, double topP, double botP,
    }
    int sz = ArraySize(g_obs);
    ArrayResize(g_obs, sz + 1);
-   g_obs[sz].name      = name;
-   g_obs[sz].time      = t;
-   g_obs[sz].topPrice  = topP;
-   g_obs[sz].botPrice  = botP;
-   g_obs[sz].extendTo  = extendTo;
-   g_obs[sz].bull      = bull;
-   g_obs[sz].mtf       = mtf;
-   g_obs[sz].mitigated = false;
+   g_obs[sz].name        = name;
+   g_obs[sz].time        = t;
+   g_obs[sz].topPrice    = topP;
+   g_obs[sz].botPrice    = botP;
+   g_obs[sz].extendTo    = extendTo;
+   g_obs[sz].bull        = bull;
+   g_obs[sz].mtf         = mtf;
+   g_obs[sz].mitigated   = false;
+   g_obs[sz].checkedUpTo = t;
 }
 
 void RemoveOBFromArray(string name)
@@ -821,13 +861,19 @@ void RemoveOBFromArray(string name)
 void UpdateOBMitigation(const datetime &time[], const double &high[],
                         const double &low[], int rates_total)
 {
+   datetime latestBar = time[rates_total - 1];
    for(int idx = 0; idx < ArraySize(g_obs); ++idx)
    {
       if(g_obs[idx].mitigated) continue;
       if(g_obs[idx].mtf) continue; // MTF OB не трекаем по текущему ТФ
+      if(g_obs[idx].checkedUpTo >= latestBar) continue; // уже проверяли
 
-      int startBar = FindBarByTime(time, rates_total, g_obs[idx].time);
-      if(startBar < 0) continue;
+      // Стартуем с бара после последнего проверенного
+      datetime sinceTime = (g_obs[idx].checkedUpTo > g_obs[idx].time)
+                              ? g_obs[idx].checkedUpTo
+                              : g_obs[idx].time;
+      int startBar = FindBarByTime(time, rates_total, sinceTime);
+      if(startBar < 0) startBar = 0;
       startBar++;
       if(startBar < 1) startBar = 1;
 
@@ -845,6 +891,8 @@ void UpdateOBMitigation(const datetime &time[], const double &high[],
       }
       if(mitTime != 0)
          MarkOBMitigatedByIndex(idx, mitTime);
+      else
+         g_obs[idx].checkedUpTo = latestBar;
    }
 }
 
@@ -1000,78 +1048,95 @@ void ClearDashboard()
    }
 }
 
-void DashLine(int row, string text, color clr)
+void DashLineSet(int row, string text, color clr)
 {
    string nm = InpObjPrefix + "dash_l" + IntegerToString(row);
-   if(ObjectFind(0, nm) < 0) ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, nm, OBJPROP_CORNER, InpDashCorner);
-   int xPad = 12, yPad = 8;
-   int rowHeight = InpDashFontSize + 5;
-   ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, InpDashX + xPad);
-   ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, InpDashY + yPad + row * rowHeight);
-   ObjectSetString (0, nm, OBJPROP_TEXT,     text);
-   ObjectSetInteger(0, nm, OBJPROP_COLOR,    clr);
-   ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, InpDashFontSize);
-   ObjectSetString (0, nm, OBJPROP_FONT,     InpDashFont);
-   ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, nm, OBJPROP_HIDDEN,   true);
-   bool rightCorner = (InpDashCorner == CORNER_RIGHT_UPPER || InpDashCorner == CORNER_RIGHT_LOWER);
-   ObjectSetInteger(0, nm, OBJPROP_ANCHOR, rightCorner ? ANCHOR_RIGHT_UPPER : ANCHOR_LEFT_UPPER);
+   if(ObjectFind(0, nm) < 0)
+   {
+      ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, nm, OBJPROP_CORNER, InpDashCorner);
+      int xPad = 12, yPad = 8;
+      int rowHeight = InpDashFontSize + 5;
+      ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, InpDashX + xPad);
+      ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, InpDashY + yPad + row * rowHeight);
+      ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, InpDashFontSize);
+      ObjectSetString (0, nm, OBJPROP_FONT,     InpDashFont);
+      ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nm, OBJPROP_HIDDEN,   true);
+      bool rightCorner = (InpDashCorner == CORNER_RIGHT_UPPER || InpDashCorner == CORNER_RIGHT_LOWER);
+      ObjectSetInteger(0, nm, OBJPROP_ANCHOR, rightCorner ? ANCHOR_RIGHT_UPPER : ANCHOR_LEFT_UPPER);
+   }
+   ObjectSetString (0, nm, OBJPROP_TEXT,  text);
+   ObjectSetInteger(0, nm, OBJPROP_COLOR, clr);
+}
+
+// Создаёт каркас дашборда (один раз)
+void DashboardLayout()
+{
+   // На случай, если параметры панели изменились — задаём фон заново
+   string bg = InpObjPrefix + "dash_bg";
+   if(ObjectFind(0, bg) >= 0)
+   {
+      ObjectSetInteger(0, bg, OBJPROP_CORNER,    InpDashCorner);
+      ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, InpDashX);
+      ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, InpDashY);
+      ObjectSetInteger(0, bg, OBJPROP_XSIZE,     InpDashWidth);
+      ObjectSetInteger(0, bg, OBJPROP_BGCOLOR,   InpDashBgColor);
+   }
 }
 
 void DashboardUpdate()
 {
-   // удалить все строки и пересоздать (простой, но надёжный путь)
-   string p = InpObjPrefix + "dash_l";
-   int total = ObjectsTotal(0, -1, -1);
-   for(int i = total - 1; i >= 0; --i)
-   {
-      string nm = ObjectName(0, i, -1, -1);
-      if(StringFind(nm, p) == 0) ObjectDelete(0, nm);
-   }
-
    string trendStr = TrendStr(g_state.trend);
    color  trendClr = TrendColor(g_state.trend);
 
    int row = 0;
-   DashLine(row++, _Symbol + "  " + EnumToString(_Period),                              InpDashAccent);
-   DashLine(row++, "─────────────────────",                                              InpDashTextColor);
-   DashLine(row++, "Тренд " + EnumToString(_Period) + ":  " + trendStr,                 trendClr);
+   DashLineSet(row++, _Symbol + "  " + EnumToString(_Period),                                InpDashAccent);
+   DashLineSet(row++, "─────────────────────",                                                InpDashTextColor);
+   DashLineSet(row++, "Тренд " + EnumToString(_Period) + ":  " + trendStr,                   trendClr);
 
    if(InpMTFEnable)
    {
       string mtfStr = TrendStr(g_mtfState.trend);
       color  mtfClr = TrendColor(g_mtfState.trend);
-      DashLine(row++, "Тренд " + EnumToString(InpMTFPeriod) + ":  " + mtfStr,           mtfClr);
+      DashLineSet(row++, "Тренд " + EnumToString(InpMTFPeriod) + ":  " + mtfStr,             mtfClr);
    }
 
-   DashLine(row++, "─ Структура ─",                                                      InpDashAccent);
-   DashLine(row++, StringFormat("BOS    +%d  / -%d",   g_cnt.bosBull,   g_cnt.bosBear),  InpDashTextColor);
-   DashLine(row++, StringFormat("CHoCH  +%d  / -%d",   g_cnt.chochBull, g_cnt.chochBear),InpDashTextColor);
-   DashLine(row++, StringFormat("Sweeps +%d  / -%d",   g_cnt.sweepBull, g_cnt.sweepBear),InpDashTextColor);
-   DashLine(row++, StringFormat("HH/HL  %d / %d",      g_cnt.swingsHH,  g_cnt.swingsHL), InpDashTextColor);
-   DashLine(row++, StringFormat("LH/LL  %d / %d",      g_cnt.swingsLH,  g_cnt.swingsLL), InpDashTextColor);
+   DashLineSet(row++, "─ Структура ─",                                                         InpDashAccent);
+   DashLineSet(row++, StringFormat("BOS    +%d  / -%d",   g_cnt.bosBull,   g_cnt.bosBear),    InpDashTextColor);
+   DashLineSet(row++, StringFormat("CHoCH  +%d  / -%d",   g_cnt.chochBull, g_cnt.chochBear),  InpDashTextColor);
+   DashLineSet(row++, StringFormat("Sweeps +%d  / -%d",   g_cnt.sweepBull, g_cnt.sweepBear),  InpDashTextColor);
+   DashLineSet(row++, StringFormat("HH/HL  %d / %d",      g_cnt.swingsHH,  g_cnt.swingsHL),   InpDashTextColor);
+   DashLineSet(row++, StringFormat("LH/LL  %d / %d",      g_cnt.swingsLH,  g_cnt.swingsLL),   InpDashTextColor);
 
    if(InpMTFEnable)
    {
-      DashLine(row++, "─ MTF структура ─",                                                InpDashAccent);
-      DashLine(row++, StringFormat("BOS    +%d  / -%d", g_cnt.mtfBosBull,   g_cnt.mtfBosBear),   InpDashTextColor);
-      DashLine(row++, StringFormat("CHoCH  +%d  / -%d", g_cnt.mtfChochBull, g_cnt.mtfChochBear), InpDashTextColor);
+      DashLineSet(row++, "─ MTF структура ─",                                                  InpDashAccent);
+      DashLineSet(row++, StringFormat("BOS    +%d  / -%d", g_cnt.mtfBosBull,   g_cnt.mtfBosBear),   InpDashTextColor);
+      DashLineSet(row++, StringFormat("CHoCH  +%d  / -%d", g_cnt.mtfChochBull, g_cnt.mtfChochBear), InpDashTextColor);
    }
 
-   DashLine(row++, "─ Зоны ─",                                                            InpDashAccent);
-   DashLine(row++, StringFormat("OB+   active %d  mit %d", g_cnt.obBullActive, g_cnt.obBullMit), InpDashTextColor);
-   DashLine(row++, StringFormat("OB-   active %d  mit %d", g_cnt.obBearActive, g_cnt.obBearMit), InpDashTextColor);
-   DashLine(row++, StringFormat("FVG   +%d  / -%d",        g_cnt.fvgBull,      g_cnt.fvgBear),   InpDashTextColor);
+   DashLineSet(row++, "─ Зоны ─",                                                              InpDashAccent);
+   DashLineSet(row++, StringFormat("OB+   active %d  mit %d", g_cnt.obBullActive, g_cnt.obBullMit), InpDashTextColor);
+   DashLineSet(row++, StringFormat("OB-   active %d  mit %d", g_cnt.obBearActive, g_cnt.obBearMit), InpDashTextColor);
+   DashLineSet(row++, StringFormat("FVG   +%d  / -%d",        g_cnt.fvgBull,      g_cnt.fvgBear),   InpDashTextColor);
 
-   DashLine(row++, "─ Объём ─",                                                           InpDashAccent);
-   DashLine(row++, StringFormat("Громких +%d / -%d  (×%.2f)", g_cnt.hivolUp, g_cnt.hivolDn, InpVolumeMultiplier), InpDashTextColor);
+   DashLineSet(row++, "─ Объём ─",                                                             InpDashAccent);
+   DashLineSet(row++, StringFormat("Громких +%d / -%d  (×%.2f)", g_cnt.hivolUp, g_cnt.hivolDn, InpVolumeMultiplier), InpDashTextColor);
 
    if(InpVPEnable)
    {
       ENUM_TIMEFRAMES vpTF = (InpVPTimeframe == PERIOD_CURRENT) ? _Period : InpVPTimeframe;
-      DashLine(row++, "─ Volume Profile ─",                                                InpDashAccent);
-      DashLine(row++, StringFormat("TF: %s  rows: %d  N: %d", EnumToString(vpTF), InpVPRows, InpVPLookback), InpDashTextColor);
+      DashLineSet(row++, "─ Volume Profile ─",                                                  InpDashAccent);
+      DashLineSet(row++, StringFormat("TF: %s  rows: %d  N: %d", EnumToString(vpTF), InpVPRows, InpVPLookback), InpDashTextColor);
+   }
+
+   // Скрываем «лишние» строки от прошлых конфигураций (если стало меньше rows)
+   for(int extra = row; extra < 30; ++extra)
+   {
+      string nm = InpObjPrefix + "dash_l" + IntegerToString(extra);
+      if(ObjectFind(0, nm) >= 0)
+         ObjectSetString(0, nm, OBJPROP_TEXT, "");
    }
 
    // Подгоняем размер фона
