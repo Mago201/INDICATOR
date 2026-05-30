@@ -2,6 +2,7 @@
 
 **v1.20** — добавлены **Entry signals** (стрелки точки входа по совпадению условий) + исправление производительности.
 **v1.30** — расширенный **Entry engine**: Premium/Discount фильтр, Strong (displacement) Order Blocks, авто SL/TP с фильтром по R:R, Score-режим вместо all-or-nothing, cooldown / anti-clustering, rejection-фитиль, VP confluence.
+**v1.31** — модуль **Liquidity Levels**: линии ликвидности BSL/SSL от свингов с авто-снятием при пробое, **Equal Highs/Lows (EQH/EQL)**, дневные (PDH/PDL/CDH/CDL) и сессионные (Asia/London/NY) уровни + счётчики в Dashboard.
 
 Один индикатор объединяет:
 - **Smart Money Concepts (SMC)** — структура, BOS, CHoCH, OB, FVG, sweeps
@@ -22,6 +23,7 @@
 | **Order Blocks** | Зоны последнего противоположного бара перед импульсом. **Серые с пунктиром** = mitigated |
 | **Fair Value Gaps** | 3-свечные имбалансы |
 | **Liquidity Sweeps** | Стрелки в местах снятия ликвидности |
+| **Liquidity Levels** | Линии BSL/SSL от свингов (снятые — серым), EQH/EQL, дневные PDH/PDL/CDH/CDL и сессионные H/L |
 | **High-Volume bars** | Стрелки над/под объёмными свечами |
 | **MTF структура** | Свинги/BOS/CHoCH/OB старшего ТФ (синим/малиновым) |
 | **Volume Profile** | Гистограмма объёмов по ценовым уровням + POC/VAH/VAL |
@@ -56,6 +58,35 @@
 ### Liquidity Sweeps
 - `InpShowLiquidity`, `InpLiquidityColor`.
 
+### Liquidity Levels (зоны ликвидности)
+Показывает **где лежит ликвидность** (резерв стопов) и снимает её визуально, когда цена проходит уровень.
+
+- `InpLiqLevelsEnable` — включить весь модуль.
+- `InpLiqShowLines` — рисовать линии ликвидности от свингов: **BSL** (buy-side) над максимумами, **SSL** (sell-side) под минимумами.
+- `InpLiqBuyColor` / `InpLiqSellColor` — цвета активных BSL / SSL.
+- `InpLiqLineStyle` / `InpLiqLineWidth` — стиль и толщина линий.
+- `InpLiqMaxPerSide` — максимум активных линий на сторону (старые удаляются).
+- `InpLiqRemoveOnSweep` — `true` = удалять линию при снятии; `false` = затемнять (`InpLiqSweptColor`) и обрывать на баре снятия.
+- `InpLiqSweptColor` — цвет снятой ликвидности.
+- `InpLiqShowLabels` — подписи у линий (BSL/SSL/EQH/EQL/PDH…).
+- `InpLiqExtendActive` — тянуть активные линии лучом вправо.
+
+**Equal Highs / Lows (EQH/EQL)** — два почти равных экстремума = «двойная вершина/дно», сильный магнит ликвидности.
+- `InpLiqShowEqual` — включить EQH/EQL.
+- `InpLiqEqualColor` — цвет соединительной линии.
+- `InpLiqEqualTolATR` — допуск «равенства» в долях ATR (0.10 = 10% ATR; если ATR недоступен — запасной допуск в пунктах).
+
+**Дневные уровни** — институциональные ориентиры.
+- `InpLiqShowDaily` — рисовать PDH/PDL (вчера) и CDH/CDL (сегодня).
+- `InpLiqDailyColor` — цвет дневных уровней.
+
+**Сессионные H/L** — ликвидность сессий по серверному времени.
+- `InpLiqShowSessions` — включить.
+- `InpLiqAsiaColor` / `InpLiqLondonColor` / `InpLiqNYColor` — цвета сессий.
+- `InpLiqAsiaStart` / `InpLiqAsiaEnd`, `InpLiqLondonStart` / `InpLiqLondonEnd`, `InpLiqNYStart` / `InpLiqNYEnd` — окна сессий (час сервера). Настройте под брокера.
+
+> Линия снимается, когда цена **проходит уровень** (`high > BSL` или `low < SSL`). Проверка инкрементальная — как у OB mitigation, без перерисовки. В Dashboard добавлена секция **Ликвидность**: активные BSL/SSL, снято линий, кластеры EQH/EQL.
+
 ### Объёмы
 - `InpShowVolume` — подсвечивать объёмные свечи.
 - `InpVolumeType` — `VOLUME_TICK` или `VOLUME_REAL` (для бирж с реальными объёмами).
@@ -88,6 +119,7 @@
 - OB активные/сработавшие отдельно для бычьих и медвежьих
 - FVG +/-
 - Громкие свечи +/- с указанием множителя
+- Ликвидность: активные BSL/SSL, снято линий, кластеры EQH/EQL
 - Параметры активного Volume Profile
 
 ### Volume Profile
