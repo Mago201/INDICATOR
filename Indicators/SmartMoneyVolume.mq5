@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.31"
+#property version   "1.40"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 4
@@ -77,6 +77,8 @@ input bool            InpLiqRemoveOnSweep = false;           // Удалять �
 input color           InpLiqSweptColor    = clrDimGray;      // Цвет снятой ликвидности
 input bool            InpLiqShowLabels    = true;            // Подписи у линий (BSL/SSL/EQH/EQL)
 input bool            InpLiqExtendActive  = true;            // Тянуть активные линии вправо (ray)
+input bool            InpLiqAlert         = false;           // Alert при снятии ликвидности (BSL/SSL)
+input bool            InpLiqAlertPush     = false;           // + push-уведомление (SendNotification)
 
 input bool            InpLiqShowEqual     = true;            // Equal Highs/Lows (EQH/EQL)
 input color           InpLiqEqualColor    = clrGold;         // Цвет EQH/EQL
@@ -95,6 +97,12 @@ input int             InpLiqLondonStart   = 8;               // Лондон: с
 input int             InpLiqLondonEnd     = 16;              // Лондон: конец (час сервера)
 input int             InpLiqNYStart       = 13;              // Нью-Йорк: старт (час сервера)
 input int             InpLiqNYEnd         = 21;              // Нью-Йорк: конец (час сервера)
+
+input group "=== Подсветка непротестированных уровней ==="
+input bool            InpHighlightUntested = false;          // Выделять свежие (непротестированные) зоны/уровни отдельным цветом
+input color           InpUntestedColor     = clrAqua;        // Цвет непротестированных зон/уровней
+input bool            InpUntestedApplyOB   = true;           // Применять к Order Blocks (свежий = ещё не сработал)
+input bool            InpUntestedApplyLiq  = true;           // Применять к линиям ликвидности (свежий = ещё не снят)
 
 input group "=== Анализ объёмов ==="
 input bool     InpShowVolume       = true;          // Подсветка объёмных свечей
@@ -186,6 +194,10 @@ input bool     InpEntryShowLabel         = true;    // Подпись у стр�
 input int      InpEntryCooldownBars      = 0;       // Cooldown между сигналами одного направления (0=выкл)
 input double   InpEntryMinDistATR        = 0.0;     // Мин. дистанция от прошлого сигнала, в ATR (0=выкл)
 
+input group "=== Entry: Liquidity grab → CHoCH ==="
+input bool     InpEntryNeedGrabChoCH = false;      // Требовать паттерн: снятие ликвидности → CHoCH в обратную сторону
+input int      InpEntryGrabMaxBars   = 8;          // Макс. баров между снятием ликвидности и CHoCH
+
 input group "=== Entry score (анти всё-или-ничего) ==="
 input bool     InpEntryUseScore          = false;   // Score-режим вместо AND-фильтра
 input int      InpEntryMinScore          = 6;       // Мин. сумма очков для сигнала
@@ -200,6 +212,7 @@ input int      InpEntryWeightPremDisc    = 2;       // Вес: Premium/Discount 
 input int      InpEntryWeightRR          = 1;       // Вес: RR >= MinRR
 input int      InpEntryWeightVPCnflu     = 1;       // Вес: близость к POC/VAH/VAL
 input int      InpEntryWeightReject      = 1;       // Вес: rejection-фитиль
+input int      InpEntryWeightGrabChoCH   = 3;       // Вес: liquidity grab → CHoCH
 
 input group "=== Производительность ==="
 input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
@@ -315,6 +328,8 @@ datetime   g_lastSweepHighTime = 0;  // была снята ликвидност
 datetime   g_lastSweepLowTime  = 0;  // была снята ликвидность с низа
 datetime   g_lastBullStructTime = 0; // последний BOS/CHoCH вверх
 datetime   g_lastBearStructTime = 0; // последний BOS/CHoCH вниз
+datetime   g_lastBullChochTime  = 0; // последний CHoCH вверх (для паттерна grab→CHoCH)
+datetime   g_lastBearChochTime  = 0; // последний CHoCH вниз (для паттерна grab→CHoCH)
 
 // ATR + VP-уровни для расширенного Entry-сценария
 int        g_atrHandle    = INVALID_HANDLE;
@@ -378,6 +393,8 @@ int OnInit()
    g_lastSweepLowTime  = 0;
    g_lastBullStructTime = 0;
    g_lastBearStructTime = 0;
+   g_lastBullChochTime  = 0;
+   g_lastBearChochTime  = 0;
    g_lastEntryUpTime  = 0;
    g_lastEntryDnTime  = 0;
    g_lastEntryUpPrice = 0.0;
@@ -498,6 +515,8 @@ int OnCalculate(const int rates_total,
       g_lastSweepLowTime  = 0;
       g_lastBullStructTime = 0;
       g_lastBearStructTime = 0;
+      g_lastBullChochTime  = 0;
+      g_lastBearChochTime  = 0;
       g_lastEntryUpTime  = 0;
       g_lastEntryDnTime  = 0;
       g_lastEntryUpPrice = 0.0;
@@ -843,7 +862,7 @@ void HandleSwingHigh(int i, const datetime &time[],
                         time[i], state.lastH.price, "CHoCH", true, ctx);
       state.trend = 1;
       AlertStructure("CHoCH bull", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfChochBull++; else { g_cnt.chochBull++; g_lastBullStructTime = time[i]; }
+      if(ctx.isMTF) g_cnt.mtfChochBull++; else { g_cnt.chochBull++; g_lastBullStructTime = time[i]; g_lastBullChochTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, true, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -900,7 +919,7 @@ void HandleSwingLow(int i, const datetime &time[],
                         time[i], state.lastL.price, "CHoCH", false, ctx);
       state.trend = -1;
       AlertStructure("CHoCH bear", time[i], ctx.isMTF);
-      if(ctx.isMTF) g_cnt.mtfChochBear++; else { g_cnt.chochBear++; g_lastBearStructTime = time[i]; }
+      if(ctx.isMTF) g_cnt.mtfChochBear++; else { g_cnt.chochBear++; g_lastBearStructTime = time[i]; g_lastBearChochTime = time[i]; }
 
       if(ctx.showOB)
          TryDrawOB(i, false, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
@@ -1039,7 +1058,10 @@ void DrawLiqLine(int idx)
    ObjectSetDouble (0, name, OBJPROP_PRICE, 0, p);
    ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
    ObjectSetDouble (0, name, OBJPROP_PRICE, 1, p);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, buy ? InpLiqBuyColor : InpLiqSellColor);
+   color liqClr = buy ? InpLiqBuyColor : InpLiqSellColor;
+   if(InpHighlightUntested && InpUntestedApplyLiq && !g_liq[idx].swept)
+      liqClr = InpUntestedColor;   // свежая (непротестированная) ликвидность
+   ObjectSetInteger(0, name, OBJPROP_COLOR, liqClr);
    ObjectSetInteger(0, name, OBJPROP_STYLE, InpLiqLineStyle);
    ObjectSetInteger(0, name, OBJPROP_WIDTH, InpLiqLineWidth);
    ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, InpLiqExtendActive);
@@ -1213,6 +1235,8 @@ void MarkLiqSwept(int idx, datetime sweptTime)
    g_liq[idx].swept     = true;
    g_liq[idx].sweptTime = sweptTime;
    g_cnt.liqSwept++;
+
+   AlertLiqSwept(g_liq[idx].buySide, g_liq[idx].price, sweptTime);
 
    string name = g_liq[idx].name;
    if(InpLiqRemoveOnSweep)
@@ -1436,6 +1460,8 @@ void TryDrawOB(int i, bool bull,
    string tag  = bull ? "obB_" : "obS_";
    string name = ctx.prefix + tag + IntegerToString((long)t1);
    color  clr  = bull ? ctx.obBullClr : ctx.obBearClr;
+   if(InpHighlightUntested && InpUntestedApplyOB && !ctx.isMTF)
+      clr = InpUntestedColor;   // свежий (непротестированный) OB — пока цена не вернулась в зону
 
    if(ObjectFind(0, name) < 0)
       ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, hi, t2, lo);
@@ -1624,6 +1650,19 @@ void AlertSweep(string what, datetime t)
    if(!InpAlertOnSweep) return;
    if(TimeCurrent() - t > PeriodSeconds() * 2) return;
    Alert(_Symbol, " ", EnumToString(_Period), " ", what, " @ ", TimeToString(t, TIME_DATE|TIME_MINUTES));
+}
+
+// Алерт при снятии линии ликвидности (BSL/SSL). Recency-guard защищает от спама на истории.
+void AlertLiqSwept(bool buySide, double price, datetime t)
+{
+   if(!InpLiqAlert) return;
+   if(TimeCurrent() - t > PeriodSeconds() * 2) return;
+   string side = buySide ? "BSL (buy-side)" : "SSL (sell-side)";
+   string msg  = StringFormat("%s %s: %s ликвидность снята @ %s",
+                              _Symbol, EnumToString(_Period), side,
+                              DoubleToString(price, _Digits));
+   Alert(msg);
+   if(InpLiqAlertPush) SendNotification(msg);
 }
 
 //+==================================================================+
@@ -1898,6 +1937,26 @@ void DrawEntryLine(string nm, datetime t1, double price, datetime t2, color clr,
    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
 }
 
+// Паттерн "liquidity grab → CHoCH": сначала снятие ликвидности (sweep свинга в обратную
+// сторону), затем в пределах InpEntryGrabMaxBars — CHoCH в направлении сделки.
+//  • BUY : снятие sell-side ликвидности (sweep low) → бычий CHoCH
+//  • SELL: снятие buy-side ликвидности (sweep high) → медвежий CHoCH
+bool GrabChochOK(bool bull, datetime t)
+{
+   long winGrab = (long)PeriodSeconds(_Period) * (long)MathMax(1, InpEntryGrabMaxBars);
+   long winRec  = (long)PeriodSeconds(_Period) * (long)MathMax(1, InpEntryRecencyBars);
+
+   datetime grabT  = bull ? g_lastSweepLowTime  : g_lastSweepHighTime;
+   datetime chochT = bull ? g_lastBullChochTime : g_lastBearChochTime;
+
+   if(grabT == 0 || chochT == 0)            return false;  // обоих событий ещё не было
+   if(chochT < grabT)                       return false;  // CHoCH должен быть ПОСЛЕ снятия
+   if((long)(chochT - grabT) > winGrab)     return false;  // слишком большой разрыв grab→CHoCH
+   if(t < chochT)                           return false;  // сигнал не раньше CHoCH
+   if((long)(t - chochT) > winRec)          return false;  // паттерн уже «остыл»
+   return true;
+}
+
 // Главный детектор entry-сигнала на закрытом баре i
 void DetectEntry(int i, int rates_total,
                  const datetime &time[],
@@ -1925,6 +1984,7 @@ void DetectEntry(int i, int rates_total,
       bool structOk   = (g_lastBullStructTime != 0 && (long)(t - g_lastBullStructTime) <= recencyTs);
       bool pdOk       = IsInPremDiscount(true, price);
       bool rejectOk   = BarRejectionOK(true, open[i], high[i], low[i], close[i]);
+      bool grabChOk   = GrabChochOK(true, t);
       bool vpCnf      = false;
       if(g_vpReady && atr > 0)
       {
@@ -1963,6 +2023,7 @@ void DetectEntry(int i, int rates_total,
          if(rrOk && rr > 0)        score += InpEntryWeightRR;
          if(vpCnf)                 score += InpEntryWeightVPCnflu;
          if(rejectOk)              score += InpEntryWeightReject;
+         if(grabChOk)              score += InpEntryWeightGrabChoCH;
          fire = (score >= InpEntryMinScore) && coolOk;
       }
       else
@@ -1977,7 +2038,7 @@ void DetectEntry(int i, int rates_total,
          fire = ok && coolOk;
          score = (trendOk?1:0) + (mtfOk?1:0) + (obOk?1:0) + (strongObOk?1:0) +
                  (volOk?1:0) + (sweepOk?1:0) + (structOk?1:0) + (pdOk?1:0) +
-                 (rejectOk?1:0) + (vpCnf?1:0);
+                 (rejectOk?1:0) + (vpCnf?1:0) + (grabChOk?1:0);
       }
 
       // Жёсткие гейты применяются ВСЕГДА (и в score, и в AND-режиме)
@@ -1985,6 +2046,7 @@ void DetectEntry(int i, int rates_total,
       if(fire && InpEntryNeedStrongOB && !strongObOk) fire = false;
       if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
       if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
+      if(fire && InpEntryNeedGrabChoCH && !grabChOk) fire = false;
       // В score-режиме чекбоксы тренд/OB/etc можно использовать как hard-gate
       if(fire && InpEntryUseScore)
       {
@@ -2020,6 +2082,7 @@ void DetectEntry(int i, int rates_total,
       bool structOk   = (g_lastBearStructTime != 0 && (long)(t - g_lastBearStructTime) <= recencyTs);
       bool pdOk       = IsInPremDiscount(false, price);
       bool rejectOk   = BarRejectionOK(false, open[i], high[i], low[i], close[i]);
+      bool grabChOk   = GrabChochOK(false, t);
       bool vpCnf      = false;
       if(g_vpReady && atr > 0)
       {
@@ -2058,6 +2121,7 @@ void DetectEntry(int i, int rates_total,
          if(rrOk && rr > 0)        score += InpEntryWeightRR;
          if(vpCnf)                 score += InpEntryWeightVPCnflu;
          if(rejectOk)              score += InpEntryWeightReject;
+         if(grabChOk)              score += InpEntryWeightGrabChoCH;
          fire = (score >= InpEntryMinScore) && coolOk;
       }
       else
@@ -2072,13 +2136,14 @@ void DetectEntry(int i, int rates_total,
          fire = ok && coolOk;
          score = (trendOk?1:0) + (mtfOk?1:0) + (obOk?1:0) + (strongObOk?1:0) +
                  (volOk?1:0) + (sweepOk?1:0) + (structOk?1:0) + (pdOk?1:0) +
-                 (rejectOk?1:0) + (vpCnf?1:0);
+                 (rejectOk?1:0) + (vpCnf?1:0) + (grabChOk?1:0);
       }
 
       if(fire && InpEntryNeedPremDisc && !pdOk) fire = false;
       if(fire && InpEntryNeedStrongOB && !strongObOk) fire = false;
       if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
       if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
+      if(fire && InpEntryNeedGrabChoCH && !grabChOk) fire = false;
       if(fire && InpEntryUseScore)
       {
          if(InpEntryNeedTrend  && !trendOk)               fire = false;
@@ -2240,6 +2305,7 @@ void DashboardUpdate()
       if(InpEntryNeedPremDisc) flt += "PD ";
       if(InpEntryNeedStrongOB) flt += "strOB ";
       if(InpEntryNeedReject)   flt += "rej ";
+      if(InpEntryNeedGrabChoCH) flt += "G→C ";
       if(InpEntryNeedRR || InpEntryMinRR > 0)
          flt += StringFormat("RR>=%.1f ", InpEntryMinRR);
       if(InpEntryCooldownBars > 0) flt += StringFormat("cd%d ", InpEntryCooldownBars);
