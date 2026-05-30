@@ -18,7 +18,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 #property description "Автоторговля по entry-сигналам индикатора SmartMoneyVolume (iCustom-мост) + риск-менеджмент."
 
@@ -37,9 +37,12 @@ enum ENUM_RISK_MODE
 //| ВХОДНЫЕ ПАРАМЕТРЫ                                                 |
 //+==================================================================+
 input group "=== Источник сигналов (индикатор) ==="
-input string InpIndicatorName = "SmartMoneyVolume"; // Имя индикатора в MQL5/Indicators (с подпапкой при необходимости)
+input bool   InpUseChartIndicator = true;     // LIVE: брать сигналы с индикатора, уже добавленного на график (ваши настройки)
+input string InpIndicatorShortName= "SmartMoney+Volume MTF"; // Короткое имя индикатора на графике (для ChartIndicatorGet)
+input string InpIndicatorName = "SmartMoneyVolume"; // Файл индикатора для iCustom (фолбэк/тестер; с подпапкой при необходимости)
 input int    InpSignalScanBars = 120;        // Сколько последних баров сканировать на свежий сигнал
-input bool   InpDebugLog       = false;       // Печатать в журнал найденные сигналы/входы
+input bool   InpTradeOnAttach  = false;       // Торговать ближайший УЖЕ существующий сигнал при старте (для проверки)
+input bool   InpDebugLog       = true;        // Печатать диагностику в журнал (сигналы/входы/причины пропуска)
 
 input group "=== SL/TP (ATR) ==="
 input int    InpAtrPeriod    = 14;           // Период ATR советника (для SL/TP)
@@ -94,6 +97,7 @@ bool     gPrimed         = false;             // пропустить уже с�
 datetime gLastEntryTime  = 0;                 // время последнего входа EA (для cooldown)
 int      gTradeDayKey    = -1;
 int      gTradesToday    = 0;
+bool     gDiagDone       = false;             // однократная диагностика истории сигналов
 
 // Реестр исходного риска (R) по тикетам позиций
 ulong    gPosTicket[];
@@ -111,14 +115,34 @@ int OnInit()
       return(INIT_FAILED);
    }
 
-   // Индикатор запускается с ДЕФОЛТНЫМИ параметрами (лимит iCustom = 63 аргумента,
-   // у индикатора ~149 входов — передать их нельзя; меняйте дефолты в индикаторе).
-   gIndHandle = iCustom(_Symbol, _Period, InpIndicatorName);
+   // Источник сигналов:
+   //  - LIVE: если индикатор уже добавлен на график — берём его хендл (ваши настройки).
+   //  - Тестер / индикатор не на графике — iCustom с ДЕФОЛТНЫМИ параметрами
+   //    (лимит iCustom = 63 аргумента, у индикатора ~149 входов — передать их нельзя).
+   gIndHandle = INVALID_HANDLE;
+   bool isTester = (bool)MQLInfoInteger(MQL_TESTER);
+
+   if(InpUseChartIndicator && !isTester)
+   {
+      gIndHandle = ChartIndicatorGet(0, 0, InpIndicatorShortName);
+      if(gIndHandle != INVALID_HANDLE)
+         PrintFormat("SmartMoneyVolumeEA: привязка к индикатору на графике '%s' (handle=%d) — торгуются ВАШИ настройки индикатора.",
+                     InpIndicatorShortName, gIndHandle);
+      else
+         PrintFormat("SmartMoneyVolumeEA: индикатор '%s' не найден на графике — фолбэк на iCustom (дефолтные настройки). Добавьте индикатор на график, чтобы торговать свои настройки.",
+                     InpIndicatorShortName);
+   }
+
    if(gIndHandle == INVALID_HANDLE)
    {
-      Print("SmartMoneyVolumeEA: не удалось создать хендл индикатора '", InpIndicatorName,
-            "'. Проверьте, что ", InpIndicatorName, ".ex5 скомпилирован в MQL5/Indicators.");
-      return(INIT_FAILED);
+      gIndHandle = iCustom(_Symbol, _Period, InpIndicatorName);
+      if(gIndHandle == INVALID_HANDLE)
+      {
+         Print("SmartMoneyVolumeEA: не удалось создать хендл индикатора '", InpIndicatorName,
+               "'. Проверьте, что ", InpIndicatorName, ".ex5 скомпилирован в MQL5/Indicators.");
+         return(INIT_FAILED);
+      }
+      PrintFormat("SmartMoneyVolumeEA: индикатор загружен через iCustom('%s') с дефолтными настройками.", InpIndicatorName);
    }
 
    trade.SetExpertMagicNumber(InpMagic);
@@ -131,6 +155,7 @@ int OnInit()
    gLastEntryTime  = 0;
    gTradeDayKey    = -1;
    gTradesToday    = 0;
+   gDiagDone       = false;
    ArrayResize(gPosTicket, 0);
    ArrayResize(gPosRisk,   0);
 
@@ -197,6 +222,10 @@ void CheckForSignal()
    if(CopyBuffer(gIndHandle, BUF_ENTRY_UP, 0, depth, up) < depth) return;
    if(CopyBuffer(gIndHandle, BUF_ENTRY_DN, 0, depth, dn) < depth) return;
 
+   // Однократная диагностика: сколько entry-сигналов индикатор дал в истории.
+   // Сразу видно, доходят ли сигналы (если 0 — ослабьте пресет индикатора).
+   if(InpDebugLog && !gDiagDone) DiagnoseSignals();
+
    // Найти САМЫЙ СВЕЖИЙ сигнал (наименьший shift >= 1)
    int  found = -1;
    bool buy   = false;
@@ -209,14 +238,19 @@ void CheckForSignal()
 
    datetime sigBar = iTime(_Symbol, _Period, found);
 
-   // Прайминг: при старте запоминаем уже существующий сигнал, но НЕ торгуем его
+   // Прайминг при старте.
    if(!gPrimed)
    {
-      gLastSignalTime = sigBar;
       gPrimed = true;
-      if(InpDebugLog) PrintFormat("SMV EA: прайминг — пропускаю существующий %s @ %s",
+      if(!InpTradeOnAttach)
+      {
+         gLastSignalTime = sigBar;          // пропускаем уже существующий сигнал
+         if(InpDebugLog) PrintFormat("SMV EA: прайминг — пропускаю существующий %s @ %s (вкл. InpTradeOnAttach, чтобы торговать его)",
+                                     buy?"BUY":"SELL", TimeToString(sigBar));
+         return;
+      }
+      if(InpDebugLog) PrintFormat("SMV EA: InpTradeOnAttach=true — торгую существующий %s @ %s",
                                   buy?"BUY":"SELL", TimeToString(sigBar));
-      return;
    }
 
    if(sigBar == gLastSignalTime) return;   // этот сигнал уже обработан
@@ -226,24 +260,64 @@ void CheckForSignal()
                                buy?"BUY":"SELL", TimeToString(sigBar), found);
 
    // Фильтры уровня EA
-   if(InpUseSession && !InSession(iTime(_Symbol,_Period,0))) return;
+   if(InpUseSession && !InSession(iTime(_Symbol,_Period,0)))
+   { if(InpDebugLog) Print("SMV EA: пропуск — вне торговой сессии EA"); return; }
    if(InpMaxSpreadPts > 0)
    {
       long spr = (long)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-      if(spr > InpMaxSpreadPts) return;
+      if(spr > InpMaxSpreadPts)
+      { if(InpDebugLog) PrintFormat("SMV EA: пропуск — спред %d > %d", (int)spr, InpMaxSpreadPts); return; }
    }
    if(InpCooldownBars > 0 && gLastEntryTime != 0)
    {
-      if(BarsBetween(gLastEntryTime, iTime(_Symbol,_Period,0)) < InpCooldownBars) return;
+      if(BarsBetween(gLastEntryTime, iTime(_Symbol,_Period,0)) < InpCooldownBars)
+      { if(InpDebugLog) Print("SMV EA: пропуск — cooldown"); return; }
    }
-   if(InpMaxTradesPerDay > 0 && gTradesToday >= InpMaxTradesPerDay) return;
+   if(InpMaxTradesPerDay > 0 && gTradesToday >= InpMaxTradesPerDay)
+   { if(InpDebugLog) Print("SMV EA: пропуск — лимит сделок в день"); return; }
 
    if(InpCloseOnReverse) CloseOpposite(buy);
 
-   if(CountPositions() >= InpMaxPositions) return;
-   if(HasPosition(buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL)) return;
+   if(CountPositions() >= InpMaxPositions)
+   { if(InpDebugLog) Print("SMV EA: пропуск — достигнут лимит позиций (InpMaxPositions)"); return; }
+   if(HasPosition(buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL))
+   { if(InpDebugLog) Print("SMV EA: пропуск — позиция этого направления уже открыта"); return; }
 
    OpenTrade(buy);
+}
+
+//+==================================================================+
+//| Диагностика: подсчёт entry-сигналов индикатора в истории         |
+//+==================================================================+
+void DiagnoseSignals()
+{
+   gDiagDone = true;
+   int calc = BarsCalculated(gIndHandle);
+   int n = MathMin(calc, MathMin(Bars(_Symbol,_Period), 3000));
+   if(n < 10) { gDiagDone = false; return; }   // ещё не готово — повторим позже
+
+   double up[], dn[];
+   ArraySetAsSeries(up, true);
+   ArraySetAsSeries(dn, true);
+   if(CopyBuffer(gIndHandle, BUF_ENTRY_UP, 0, n, up) < n) { gDiagDone=false; return; }
+   if(CopyBuffer(gIndHandle, BUF_ENTRY_DN, 0, n, dn) < n) { gDiagDone=false; return; }
+
+   int cu=0, cd=0, lastShift=-1; bool lastBuy=false;
+   for(int s=1; s<n; ++s)
+   {
+      bool u=IsSignal(up[s]), d=IsSignal(dn[s]);
+      if(u) cu++;
+      if(d) cd++;
+      if(lastShift<0 && (u||d)) { lastShift=s; lastBuy=u; }
+   }
+   PrintFormat("SMV EA ДИАГНОСТИКА: за %d баров entry-сигналов индикатора: BUY=%d, SELL=%d.", n, cu, cd);
+   if(cu+cd == 0)
+      Print("SMV EA ДИАГНОСТИКА: сигналов НЕТ. Индикатор с текущими настройками не даёт входов на этом символе/ТФ. ",
+            "Ослабьте пресет (в live добавьте индикатор на график и настройте; в тестере — измените дефолты в SmartMoneyVolume.mq5: ",
+            "напр. InpEntryUseScore=true + InpEntryMinScore пониже, или отключите часть Need-условий).");
+   else
+      PrintFormat("SMV EA ДИАГНОСТИКА: последний сигнал — %s на shift %d (@ %s). Советник торгует НОВЫЕ сигналы после старта.",
+                  lastBuy?"BUY":"SELL", lastShift, TimeToString(iTime(_Symbol,_Period,lastShift>0?lastShift:1)));
 }
 
 // Значение буфера — валидный сигнал (не EMPTY_VALUE и положительная цена)
@@ -258,7 +332,8 @@ bool IsSignal(double v)
 void OpenTrade(bool buy)
 {
    double atr = CurrentATR();
-   if(atr <= 0.0) return;
+   if(atr <= 0.0)
+   { if(InpDebugLog) Print("SMV EA: вход отменён — ATR ещё не готов (0)"); return; }
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -282,7 +357,8 @@ void OpenTrade(bool buy)
    if(!RespectStops(buy, entry, sl, tp)) return;
 
    double lots = CalcLots(MathAbs(entry - sl));
-   if(lots <= 0.0) return;
+   if(lots <= 0.0)
+   { if(InpDebugLog) Print("SMV EA: вход отменён — рассчитанный объём = 0"); return; }
 
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
@@ -295,6 +371,8 @@ void OpenTrade(bool buy)
             " (", trade.ResultRetcodeDescription(), ")");
       return;
    }
+   if(InpDebugLog) PrintFormat("SMV EA: ВХОД %s %.2f лот @ %.5f  SL %.5f  TP %.5f",
+                               buy?"BUY":"SELL", lots, entry, sl, tp);
 
    gLastEntryTime = iTime(_Symbol,_Period,0);
    gTradesToday++;
