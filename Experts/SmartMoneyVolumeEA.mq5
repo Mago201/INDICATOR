@@ -6,9 +6,19 @@
 //|   сделки с расчётом объёма по риску, безубытком и трейлингом.      |
 //|                                            Copyright 2026 Mago201 |
 //+------------------------------------------------------------------+
+//  ВАЖНО про конфигурацию стратегии:
+//  В MQL5 действует жёсткий лимит — не более 63 аргументов у iCustom.
+//  У индикатора SmartMoneyVolume ~149 входов, причём entry-параметры
+//  расположены в конце списка, поэтому передать их через iCustom нельзя
+//  (префиксом до них не добраться). Поэтому советник запускает индикатор
+//  с его ЗНАЧЕНИЯМИ ПО УМОЛЧАНИЮ. Чтобы изменить набор условий входа
+//  (score-режим, Premium/Discount, RR, grab->CHoCH и т.д.), измените
+//  значения по умолчанию во входах самого индикатора SmartMoneyVolume.mq5
+//  и перекомпилируйте его — советник подхватит новые дефолты.
+//+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 #property description "Автоторговля по entry-сигналам индикатора SmartMoneyVolume (iCustom-мост) + риск-менеджмент."
 
@@ -24,213 +34,25 @@ enum ENUM_RISK_MODE
 };
 
 //+==================================================================+
-//| ПАРАМЕТРЫ ИНДИКАТОРА SmartMoneyVolume                             |
-//| (передаются в iCustom в ТОЧНО ТОМ ЖЕ порядке, что объявлены в     |
-//|  индикаторе — менять порядок нельзя!)                            |
+//| ВХОДНЫЕ ПАРАМЕТРЫ                                                 |
 //+==================================================================+
-input group "=== Структура (Swing / BOS / CHoCH) ==="
-input int      InpSwingLength      = 5;             // Длина свинга (баров слева/справа)
-input bool     InpShowSwings       = true;          // Метки HH/HL/LH/LL
-input bool     InpShowBOS          = true;          // Линии BOS
-input bool     InpShowCHOCH        = true;          // Линии CHoCH
-input color    InpBullColor        = clrLime;       // Цвет бычьих структур
-input color    InpBearColor        = clrRed;        // Цвет медвежьих структур
+input group "=== Источник сигналов (индикатор) ==="
+input string InpIndicatorName = "SmartMoneyVolume"; // Имя индикатора в MQL5/Indicators (с подпапкой при необходимости)
+input int    InpSignalScanBars = 120;        // Сколько последних баров сканировать на свежий сигнал
+input bool   InpDebugLog       = false;       // Печатать в журнал найденные сигналы/входы
 
-input group "=== Order Blocks + Mitigation ==="
-input bool     InpShowOB           = true;          // Показывать ордер-блоки (нужно для entry!)
-input int      InpOBMaxCount       = 5;             // Максимум активных OB на сторону
-input color    InpBullOBColor      = clrSeaGreen;   // Цвет бычьего OB
-input color    InpBearOBColor      = clrCrimson;    // Цвет медвежьего OB
-input int      InpOBExtendBars     = 30;            // Длина OB вправо (в барах)
-input bool     InpOBHideMitigated  = false;         // Скрывать сработавшие OB
-input color    InpOBMitigatedClr   = clrDimGray;    // Цвет сработавшего OB
-input bool     InpOBExtendOnTouch  = true;          // Обрезать OB по моменту касания
-
-input group "=== Fair Value Gaps ==="
-input bool     InpShowFVG          = true;          // Показывать FVG / имбалансы
-input int      InpFVGMaxCount      = 10;            // Максимум активных FVG на сторону
-input color    InpBullFVGColor     = clrDarkGreen;
-input color    InpBearFVGColor     = clrDarkRed;
-input int      InpFVGExtendBars    = 20;
-
-input group "=== Liquidity Sweeps ==="
-input bool     InpShowLiquidity    = true;          // Нужно для sweep/grab-условий entry!
-input color    InpLiquidityColor   = clrGold;
-
-input group "=== Liquidity Levels (зоны ликвидности) ==="
-input bool            InpLiqLevelsEnable  = true;            // Включить зоны ликвидности
-input bool            InpLiqShowLines     = true;            // Линии ликвидности от свингов (BSL/SSL)
-input color           InpLiqBuyColor      = clrDeepSkyBlue;  // Цвет BSL (над максимумами)
-input color           InpLiqSellColor     = clrTomato;       // Цвет SSL (под минимумами)
-input ENUM_LINE_STYLE InpLiqLineStyle     = STYLE_DOT;       // Стиль линий ликвидности
-input int             InpLiqLineWidth     = 1;               // Толщина линий ликвидности
-input int             InpLiqMaxPerSide    = 8;               // Макс. активных линий на сторону
-input bool            InpLiqRemoveOnSweep = false;           // Удалять линию при снятии (иначе затемнять)
-input color           InpLiqSweptColor    = clrDimGray;      // Цвет снятой ликвидности
-input bool            InpLiqShowLabels    = true;            // Подписи у линий (BSL/SSL/EQH/EQL)
-input bool            InpLiqExtendActive  = true;            // Тянуть активные линии вправо (ray)
-input bool            InpLiqAlert         = false;           // Alert при снятии ликвидности (BSL/SSL)
-input bool            InpLiqAlertPush     = false;           // + push-уведомление (SendNotification)
-
-input bool            InpLiqShowEqual     = true;            // Equal Highs/Lows (EQH/EQL)
-input color           InpLiqEqualColor    = clrGold;         // Цвет EQH/EQL
-input double          InpLiqEqualTolATR   = 0.10;            // Допуск «равенства» (доли ATR)
-
-input bool            InpLiqShowDaily     = true;            // Дневные уровни PDH/PDL и CDH/CDL
-input color           InpLiqDailyColor    = clrMediumPurple; // Цвет дневных уровней
-
-input bool            InpLiqShowSessions  = true;            // Сессионные H/L (ликвидность сессий)
-input color           InpLiqAsiaColor     = C'90,90,170';    // Азия
-input color           InpLiqLondonColor   = C'70,150,90';    // Лондон
-input color           InpLiqNYColor       = C'170,120,60';   // Нью-Йорк
-input int             InpLiqAsiaStart     = 0;               // Азия: старт (час сервера)
-input int             InpLiqAsiaEnd       = 8;               // Азия: конец (час сервера)
-input int             InpLiqLondonStart   = 8;               // Лондон: старт (час сервера)
-input int             InpLiqLondonEnd     = 16;              // Лондон: конец (час сервера)
-input int             InpLiqNYStart       = 13;              // Нью-Йорк: старт (час сервера)
-input int             InpLiqNYEnd         = 21;              // Нью-Йорк: конец (час сервера)
-
-input group "=== Подсветка непротестированных уровней ==="
-input bool            InpHighlightUntested = false;          // Выделять свежие (непротестированные) зоны/уровни отдельным цветом
-input color           InpUntestedColor     = clrAqua;        // Цвет непротестированных зон/уровней
-input bool            InpUntestedApplyOB   = true;           // Применять к Order Blocks (свежий = ещё не сработал)
-input bool            InpUntestedApplyLiq  = true;           // Применять к линиям ликвидности (свежий = ещё не снят)
-
-input group "=== Анализ объёмов ==="
-input bool     InpShowVolume       = true;          // Нужно для volume-условия entry!
-input ENUM_APPLIED_VOLUME InpVolumeType = VOLUME_TICK;
-input int      InpVolumePeriod     = 20;
-input double   InpVolumeMultiplier = 1.8;
-input bool     InpShowVolText      = false;
-input color    InpVolTextColor     = clrSilver;
-
-input group "=== MTF (старший таймфрейм) ==="
-input bool             InpMTFEnable     = true;          // Включить MTF
-input ENUM_TIMEFRAMES  InpMTFPeriod     = PERIOD_H1;     // Старший ТФ для структуры
-input int              InpMTFLookback   = 300;           // Сколько баров MTF анализировать
-input bool             InpMTFShowSwings = true;          // Метки HH/HL на MTF
-input bool             InpMTFShowBOS    = true;          // Линии BOS на MTF
-input bool             InpMTFShowCHOCH  = true;          // Линии CHoCH на MTF
-input bool             InpMTFShowOB     = true;          // Order Blocks на MTF
-input color            InpMTFBullColor  = clrAqua;       // Цвет бычьих MTF структур
-input color            InpMTFBearColor  = clrMagenta;    // Цвет медвежьих MTF структур
-input color            InpMTFBullOBClr  = C'30,80,120';  // Бычий MTF OB
-input color            InpMTFBearOBClr  = C'120,30,80';  // Медвежий MTF OB
-input int              InpMTFLineWidth  = 2;             // Толщина линий MTF
-
-input group "=== Dashboard ==="
-input bool             InpDashEnable    = true;
-input ENUM_BASE_CORNER InpDashCorner    = CORNER_RIGHT_UPPER;
-input int              InpDashX         = 10;
-input int              InpDashY         = 20;
-input color            InpDashTextColor = clrWhite;
-input color            InpDashBgColor   = C'30,30,40';
-input color            InpDashAccent    = clrGold;
-input int              InpDashFontSize  = 9;
-input string           InpDashFont      = "Consolas";
-input int              InpDashWidth     = 240;
-
-input group "=== Volume Profile ==="
-input bool             InpVPEnable      = true;
-input ENUM_TIMEFRAMES  InpVPTimeframe   = PERIOD_CURRENT; // ТФ для расчёта VP
-input int              InpVPLookback    = 200;            // Сколько баров для VP
-input int              InpVPRows        = 50;             // Количество ценовых зон
-input int              InpVPWidthPct    = 25;             // Ширина VP в % от видимой области
-input color            InpVPColor       = C'70,70,120';
-input color            InpVPPocColor    = clrGold;
-input color            InpVPVaColor     = C'120,120,200';
-input bool             InpVPShowPoc     = true;
-input bool             InpVPShowVa      = true;
-input double           InpVPValueArea   = 0.70;           // Доля объёма для Value Area (0.7 = 70%)
-input bool             InpVPRightSide   = true;           // Гистограмма справа
-
-input group "=== Entry signals (стрелки точки входа) ==="
-input bool     InpEntryEnable        = true;        // ДОЛЖНО быть true — иначе сигналов нет
-input bool     InpEntryNeedTrend     = true;        // Требовать совпадения с трендом текущ. ТФ
-input bool     InpEntryNeedMTF       = false;       // Требовать совпадения с трендом MTF
-input bool     InpEntryNeedOB        = true;        // Цена должна быть внутри активного OB
-input bool     InpEntryNeedVolume    = true;        // Бар должен быть громким (того же цвета)
-input bool     InpEntryNeedSweep     = false;       // Недавний sweep в обратную сторону
-input bool     InpEntryNeedStruct    = false;       // Недавний BOS/CHoCH в нужную сторону
-input int      InpEntryRecencyBars   = 5;           // Окно «недавности» (баров) для sweep/struct
-input color    InpEntryUpColor       = clrLime;     // Цвет стрелки покупки
-input color    InpEntryDnColor       = clrRed;      // Цвет стрелки продажи
-input int      InpEntryUpArrow       = 233;         // Wingdings код стрелки вверх (233=▲)
-input int      InpEntryDnArrow       = 234;         // Wingdings код стрелки вниз (234=▼)
-input int      InpEntryArrowWidth    = 4;           // Толщина стрелки
-input int      InpEntryArrowShift    = 30;          // Смещение в пикселях от свечи
-input bool     InpEntryAlert         = false;       // Алерт при появлении entry-сигнала
-
-input group "=== Entry filters (расширенные) ==="
-input bool     InpEntryNeedPremDisc      = false;   // Требовать Premium/Discount (BUY в нижней половине, SELL в верхней)
-input bool     InpEntryPremDiscMTF       = false;   // Брать диапазон с MTF, иначе с текущего ТФ
-input double   InpEntryPremDiscMid       = 0.50;    // Граница (0.5 = середина диапазона)
-input double   InpEntryPremDiscDelta     = 0.05;    // Буфер от середины (0..0.5)
-
-input bool     InpEntryNeedStrongOB      = false;   // Требовать "сильный" OB (с FVG-импульсом сразу после)
-input int      InpEntryOBImpulseMaxBars  = 6;       // Макс. баров после OB для поиска FVG-импульса
-
-input bool     InpEntryNeedReject        = false;   // Требовать rejection-фитиль на баре сигнала
-input bool     InpEntryNeedRR            = false;   // Жёсткий фильтр по RR (не давать сигнал, если ниже мин.)
-input double   InpEntryMinRR             = 1.5;     // Минимальное R:R для сигнала
-input double   InpEntrySLATRMult         = 0.30;    // Буфер SL за границу OB (доли ATR)
-input int      InpEntryATRPeriod         = 14;      // Период ATR (индикатора)
-input bool     InpEntryUseVPForTP        = true;    // Учитывать POC/VAH/VAL как кандидатов TP
-
-input bool     InpEntryShowLevels        = true;    // Рисовать SL/TP1/TP2 у стрелки
-input color    InpEntrySLColor           = clrCrimson;
-input color    InpEntryTPColor           = clrSeaGreen;
-input int      InpEntryLevelsBars        = 12;      // Длина пунктиров SL/TP вправо (баров)
-input bool     InpEntryShowLabel         = true;    // Подпись у стрелки (score / RR)
-
-input int      InpEntryCooldownBars      = 0;       // Cooldown между сигналами одного направления (0=выкл)
-input double   InpEntryMinDistATR        = 0.0;     // Мин. дистанция от прошлого сигнала, в ATR (0=выкл)
-
-input group "=== Entry: Liquidity grab -> CHoCH ==="
-input bool     InpEntryNeedGrabChoCH = false;      // Требовать паттерн: снятие ликвидности -> CHoCH в обратную сторону
-input int      InpEntryGrabMaxBars   = 8;          // Макс. баров между снятием ликвидности и CHoCH
-
-input group "=== Entry score (анти всё-или-ничего) ==="
-input bool     InpEntryUseScore          = false;   // Score-режим вместо AND-фильтра
-input int      InpEntryMinScore          = 6;       // Мин. сумма очков для сигнала
-input int      InpEntryWeightTrend       = 2;       // Вес: совпадение с трендом ТФ
-input int      InpEntryWeightMTF         = 2;       // Вес: совпадение с MTF
-input int      InpEntryWeightOB          = 2;       // Вес: цена в активном OB
-input int      InpEntryWeightStrongOB    = 2;       // Вес: OB сильный (displacement)
-input int      InpEntryWeightVolume      = 1;       // Вес: бар громкий
-input int      InpEntryWeightSweep       = 2;       // Вес: недавний sweep
-input int      InpEntryWeightStruct      = 2;       // Вес: недавний BOS/CHoCH
-input int      InpEntryWeightPremDisc    = 2;       // Вес: Premium/Discount ОК
-input int      InpEntryWeightRR          = 1;       // Вес: RR >= MinRR
-input int      InpEntryWeightVPCnflu     = 1;       // Вес: близость к POC/VAH/VAL
-input int      InpEntryWeightReject      = 1;       // Вес: rejection-фитиль
-input int      InpEntryWeightGrabChoCH   = 3;       // Вес: liquidity grab -> CHoCH
-
-input group "=== Производительность (индикатора) ==="
-input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
-input bool     InpHeavyOnNewBarOnly= true;        // Тяжёлые задачи только на новом баре
-input bool     InpProcessUnclosed  = false;       // Обрабатывать объёмы на текущем (незакрытом) баре
-
-input group "=== Прочее (индикатора) ==="
-input string   InpObjPrefix        = "SMV_";
-input bool     InpAlertOnBOS       = false;
-input bool     InpAlertOnSweep     = false;
-
-//+==================================================================+
-//| ПАРАМЕТРЫ СОВЕТНИКА (исполнение и риск-менеджмент)                |
-//+==================================================================+
-input group "=== СОВЕТНИК: SL/TP (ATR) ==="
+input group "=== SL/TP (ATR) ==="
 input int    InpAtrPeriod    = 14;           // Период ATR советника (для SL/TP)
 input double InpSLATR        = 1.50;         // SL = ATR * множитель
 input double InpRR           = 1.50;         // R:R (TP = риск * RR)
 
-input group "=== СОВЕТНИК: управление капиталом ==="
+input group "=== Управление капиталом ==="
 input ENUM_RISK_MODE InpRiskMode = RISK_PERCENT;  // Режим расчёта объёма
 input double InpFixedLots     = 0.10;        // Фиксированный лот (для RISK_FIXED_LOT)
 input double InpRiskPercent   = 1.0;         // Риск на сделку, % от баланса (для RISK_PERCENT)
 input double InpMaxLots       = 0.0;         // Ограничение макс. лота (0=только биржевой максимум)
 
-input group "=== СОВЕТНИК: управление позицией ==="
+input group "=== Управление позицией ==="
 input int    InpMaxPositions  = 1;           // Макс. одновременно открытых позиций (по этому EA)
 input bool   InpCloseOnReverse= true;        // Закрывать противоположную позицию при встречном сигнале
 input bool   InpUseBreakeven  = true;        // Перевод в безубыток
@@ -240,20 +62,19 @@ input bool   InpUseTrailing   = false;       // Трейлинг-стоп
 input double InpTrailStartR   = 1.00;        // Старт трейлинга при прибыли >= R
 input double InpTrailDistR    = 1.00;        // Дистанция трейлинга (в R от текущей цены)
 
-input group "=== СОВЕТНИК: фильтры и лимиты ==="
+input group "=== Фильтры и лимиты ==="
 input int    InpMaxTradesPerDay = 0;         // Макс. входов в день (0=без лимита)
-input bool   InpUseSession      = false;     // Доп. фильтр сессии на уровне EA
+input bool   InpUseSession      = false;     // Фильтр сессии на уровне EA
 input int    InpSessStartHour   = 8;         // Старт окна (час сервера)
 input int    InpSessEndHour     = 21;        // Конец окна (час сервера)
 input int    InpMaxSpreadPts    = 0;         // Макс. спред в пунктах сейчас (0=выкл)
 input int    InpCooldownBars    = 0;         // Пауза между входами EA, баров (0=выкл)
 
-input group "=== СОВЕТНИК: исполнение ==="
+input group "=== Исполнение ==="
 input long   InpMagic        = 26012027;     // Magic number
 input int    InpSlippagePts  = 20;           // Допустимое проскальзывание (пункты)
 input string InpComment      = "SmartMoneyVolume";  // Комментарий к ордерам
 input bool   InpSymbolGuard  = false;        // Предупреждать, если символ не похож на золото
-input string InpIndicatorName = "SmartMoneyVolume"; // Имя индикатора для iCustom (в MQL5/Indicators)
 
 //+==================================================================+
 //| ГЛОБАЛЬНЫЕ ОБЪЕКТЫ И ПЕРЕМЕННЫЕ                                    |
@@ -266,7 +87,7 @@ int      gAtrHandle = INVALID_HANDLE;        // ATR советника
 #define  BUF_ENTRY_UP  2                      // индекс буфера EntryUp в индикаторе
 #define  BUF_ENTRY_DN  3                      // индекс буфера EntryDn в индикаторе
 
-datetime gLastBarTime    = 0;                 // детект нового бара
+datetime gLastBarTime    = 0;                 // детект нового бара (для дневного лимита)
 datetime gLastSignalTime = 0;                 // время бара последнего обработанного сигнала
 bool     gPrimed         = false;             // пропустить уже существующий сигнал при старте
 
@@ -283,7 +104,6 @@ double   gPosRisk[];
 //+==================================================================+
 int OnInit()
 {
-   // --- ATR советника
    gAtrHandle = iATR(_Symbol, _Period, MathMax(2, InpAtrPeriod));
    if(gAtrHandle == INVALID_HANDLE)
    {
@@ -291,43 +111,15 @@ int OnInit()
       return(INIT_FAILED);
    }
 
-   // --- индикатор через iCustom (порядок параметров строго как в индикаторе!)
-   gIndHandle = iCustom(_Symbol, _Period, InpIndicatorName,
-      InpSwingLength,InpShowSwings,InpShowBOS,InpShowCHOCH,InpBullColor,InpBearColor,
-      InpShowOB,InpOBMaxCount,InpBullOBColor,InpBearOBColor,InpOBExtendBars,InpOBHideMitigated,
-      InpOBMitigatedClr,InpOBExtendOnTouch,InpShowFVG,InpFVGMaxCount,InpBullFVGColor,InpBearFVGColor,
-      InpFVGExtendBars,InpShowLiquidity,InpLiquidityColor,InpLiqLevelsEnable,InpLiqShowLines,InpLiqBuyColor,
-      InpLiqSellColor,InpLiqLineStyle,InpLiqLineWidth,InpLiqMaxPerSide,InpLiqRemoveOnSweep,InpLiqSweptColor,
-      InpLiqShowLabels,InpLiqExtendActive,InpLiqAlert,InpLiqAlertPush,InpLiqShowEqual,InpLiqEqualColor,
-      InpLiqEqualTolATR,InpLiqShowDaily,InpLiqDailyColor,InpLiqShowSessions,InpLiqAsiaColor,InpLiqLondonColor,
-      InpLiqNYColor,InpLiqAsiaStart,InpLiqAsiaEnd,InpLiqLondonStart,InpLiqLondonEnd,InpLiqNYStart,
-      InpLiqNYEnd,InpHighlightUntested,InpUntestedColor,InpUntestedApplyOB,InpUntestedApplyLiq,InpShowVolume,
-      InpVolumeType,InpVolumePeriod,InpVolumeMultiplier,InpShowVolText,InpVolTextColor,InpMTFEnable,
-      InpMTFPeriod,InpMTFLookback,InpMTFShowSwings,InpMTFShowBOS,InpMTFShowCHOCH,InpMTFShowOB,
-      InpMTFBullColor,InpMTFBearColor,InpMTFBullOBClr,InpMTFBearOBClr,InpMTFLineWidth,InpDashEnable,
-      InpDashCorner,InpDashX,InpDashY,InpDashTextColor,InpDashBgColor,InpDashAccent,
-      InpDashFontSize,InpDashFont,InpDashWidth,InpVPEnable,InpVPTimeframe,InpVPLookback,
-      InpVPRows,InpVPWidthPct,InpVPColor,InpVPPocColor,InpVPVaColor,InpVPShowPoc,
-      InpVPShowVa,InpVPValueArea,InpVPRightSide,InpEntryEnable,InpEntryNeedTrend,InpEntryNeedMTF,
-      InpEntryNeedOB,InpEntryNeedVolume,InpEntryNeedSweep,InpEntryNeedStruct,InpEntryRecencyBars,InpEntryUpColor,
-      InpEntryDnColor,InpEntryUpArrow,InpEntryDnArrow,InpEntryArrowWidth,InpEntryArrowShift,InpEntryAlert,
-      InpEntryNeedPremDisc,InpEntryPremDiscMTF,InpEntryPremDiscMid,InpEntryPremDiscDelta,InpEntryNeedStrongOB,InpEntryOBImpulseMaxBars,
-      InpEntryNeedReject,InpEntryNeedRR,InpEntryMinRR,InpEntrySLATRMult,InpEntryATRPeriod,InpEntryUseVPForTP,
-      InpEntryShowLevels,InpEntrySLColor,InpEntryTPColor,InpEntryLevelsBars,InpEntryShowLabel,InpEntryCooldownBars,
-      InpEntryMinDistATR,InpEntryNeedGrabChoCH,InpEntryGrabMaxBars,InpEntryUseScore,InpEntryMinScore,InpEntryWeightTrend,
-      InpEntryWeightMTF,InpEntryWeightOB,InpEntryWeightStrongOB,InpEntryWeightVolume,InpEntryWeightSweep,InpEntryWeightStruct,
-      InpEntryWeightPremDisc,InpEntryWeightRR,InpEntryWeightVPCnflu,InpEntryWeightReject,InpEntryWeightGrabChoCH,InpHistoryBars,
-      InpHeavyOnNewBarOnly,InpProcessUnclosed,InpObjPrefix,InpAlertOnBOS,InpAlertOnSweep);
-
+   // Индикатор запускается с ДЕФОЛТНЫМИ параметрами (лимит iCustom = 63 аргумента,
+   // у индикатора ~149 входов — передать их нельзя; меняйте дефолты в индикаторе).
+   gIndHandle = iCustom(_Symbol, _Period, InpIndicatorName);
    if(gIndHandle == INVALID_HANDLE)
    {
       Print("SmartMoneyVolumeEA: не удалось создать хендл индикатора '", InpIndicatorName,
-            "'. Убедитесь, что ", InpIndicatorName, ".ex5 скомпилирован в MQL5/Indicators.");
+            "'. Проверьте, что ", InpIndicatorName, ".ex5 скомпилирован в MQL5/Indicators.");
       return(INIT_FAILED);
    }
-
-   if(!InpEntryEnable)
-      Print("SmartMoneyVolumeEA: ВНИМАНИЕ — InpEntryEnable=false, индикатор не будет давать сигналов.");
 
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(MathMax(0, InpSlippagePts));
@@ -383,46 +175,57 @@ void OnTick()
       }
    }
 
-   // Сигнал читаем КАЖДЫЙ тик (iCustom может пересчитаться позже OnTick),
+   // Сигнал читаем КАЖДЫЙ тик (iCustom может пересчитаться позже OnTick);
    // защита от дублей — по времени бара сигнала (gLastSignalTime).
    CheckForSignal();
 }
 
 //+==================================================================+
-//| Чтение entry-сигнала индикатора и вход                            |
+//| Чтение свежего entry-сигнала индикатора и вход                    |
 //+==================================================================+
 void CheckForSignal()
 {
-   // Индикатор подтверждает сигнал на баре спустя InpSwingLength баров:
-   // last_confirmable = rates_total - InpSwingLength - 1  =>  shift = InpSwingLength.
-   int sh = MathMax(1, InpSwingLength);
-
-   // Готовность индикатора
-   int calc = BarsCalculated(gIndHandle);
-   if(calc <= sh + 2) return;
+   int depth = MathMax(10, InpSignalScanBars);
+   int calc  = BarsCalculated(gIndHandle);
+   if(calc < depth) depth = calc;
+   if(depth < 5) return;
+   if(Bars(_Symbol,_Period) < depth) return;
 
    double up[], dn[];
-   if(CopyBuffer(gIndHandle, BUF_ENTRY_UP, sh, 1, up) != 1) return;
-   if(CopyBuffer(gIndHandle, BUF_ENTRY_DN, sh, 1, dn) != 1) return;
+   ArraySetAsSeries(up, true);
+   ArraySetAsSeries(dn, true);
+   if(CopyBuffer(gIndHandle, BUF_ENTRY_UP, 0, depth, up) < depth) return;
+   if(CopyBuffer(gIndHandle, BUF_ENTRY_DN, 0, depth, dn) < depth) return;
 
-   bool buy  = IsSignal(up[0]);
-   bool sell = IsSignal(dn[0]);
+   // Найти САМЫЙ СВЕЖИЙ сигнал (наименьший shift >= 1)
+   int  found = -1;
+   bool buy   = false;
+   for(int s=1; s<depth; ++s)
+   {
+      if(IsSignal(up[s])) { found=s; buy=true;  break; }
+      if(IsSignal(dn[s])) { found=s; buy=false; break; }
+   }
+   if(found < 0) return;
 
-   datetime sigBar = iTime(_Symbol, _Period, sh);
+   datetime sigBar = iTime(_Symbol, _Period, found);
 
-   // Прайминг: при первом запуске запоминаем уже существующий сигнал, но НЕ торгуем его
+   // Прайминг: при старте запоминаем уже существующий сигнал, но НЕ торгуем его
    if(!gPrimed)
    {
       gLastSignalTime = sigBar;
       gPrimed = true;
+      if(InpDebugLog) PrintFormat("SMV EA: прайминг — пропускаю существующий %s @ %s",
+                                  buy?"BUY":"SELL", TimeToString(sigBar));
       return;
    }
 
-   if(!buy && !sell) return;
-   if(sigBar == gLastSignalTime) return;   // этот бар уже обработан
-   gLastSignalTime = sigBar;
+   if(sigBar == gLastSignalTime) return;   // этот сигнал уже обработан
+   gLastSignalTime = sigBar;               // помечаем обработанным (без повторов в т.ч. при стопе внутри бара)
 
-   // Доп. фильтры уровня EA
+   if(InpDebugLog) PrintFormat("SMV EA: новый сигнал %s @ %s (shift %d)",
+                               buy?"BUY":"SELL", TimeToString(sigBar), found);
+
+   // Фильтры уровня EA
    if(InpUseSession && !InSession(iTime(_Symbol,_Period,0))) return;
    if(InpMaxSpreadPts > 0)
    {
@@ -431,12 +234,10 @@ void CheckForSignal()
    }
    if(InpCooldownBars > 0 && gLastEntryTime != 0)
    {
-      int passed = BarsBetween(gLastEntryTime, curTimeSafe());
-      if(passed < InpCooldownBars) return;
+      if(BarsBetween(gLastEntryTime, iTime(_Symbol,_Period,0)) < InpCooldownBars) return;
    }
    if(InpMaxTradesPerDay > 0 && gTradesToday >= InpMaxTradesPerDay) return;
 
-   // Закрытие встречной позиции
    if(InpCloseOnReverse) CloseOpposite(buy);
 
    if(CountPositions() >= InpMaxPositions) return;
@@ -449,11 +250,6 @@ void CheckForSignal()
 bool IsSignal(double v)
 {
    return(v > 0.0 && v < (DBL_MAX/2.0));
-}
-
-datetime curTimeSafe()
-{
-   return(iTime(_Symbol,_Period,0));
 }
 
 //+==================================================================+
