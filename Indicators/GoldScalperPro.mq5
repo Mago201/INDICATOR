@@ -4,12 +4,13 @@
 //|       Trend EMA stack + Daily VWAP bias + RSI pullback trigger   |
 //|       + HTF trend confirm + ATR-relative vol/spread filters      |
 //|       + partial TP1/TP2 + win-rate/best-hours + symbol profiles  |
+//|       + Fibonacci levels + lunar-phase overlay (no proven edge)  |
 //|       Multi-symbol: gold, FX, indices, crypto (auto profile)     |
 //|                                            Copyright 2026 Mago201|
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 6
@@ -138,6 +139,19 @@ input color  InpTPColor      = clrSeaGreen;  // Цвет TP
 input group "=== Алерты ==="
 input bool   InpAlert        = true;         // Popup/звуковой алерт на свежем сигнале
 input bool   InpAlertPush    = false;        // Push-уведомление (SendNotification)
+
+input group "=== Фибоначчи (авто-разметка от свинга) ==="
+input bool   InpShowFib       = true;        // Авто-уровни Фибоначчи от последнего свинг-импульса
+input int    InpFibPivot      = 5;           // Окно пивота (баров слева/справа для свинга)
+input int    InpFibExtendBars = 40;          // Длина линий вправо (баров)
+input bool   InpFibShowExt    = true;        // Показывать расширения 1.272 / 1.618 (кандидаты TP)
+input color  InpFibColor      = clrGoldenrod;     // Цвет уровней ретрейсмента
+input color  InpFibExtColor   = clrMediumPurple;  // Цвет расширений
+
+input group "=== Астро-оверлей: фазы Луны (БЕЗ доказанного перевеса) ==="
+input bool   InpShowAstro     = false;       // Метки новолуния/полнолуния — ТОЛЬКО для вашей проверки
+input color  InpAstroNewColor = C'90,90,105';     // Новолуние (вертикаль)
+input color  InpAstroFullColor= C'160,160,90';    // Полнолуние (вертикаль)
 
 input group "=== Dashboard / статистика ==="
 input bool             InpShowDash   = true;          // Панель со статистикой
@@ -411,6 +425,8 @@ int OnCalculate(const int rates_total,
    {
       RecomputeSignals(rates_total, startBar, time, open, high, low, close, spread);
       if(InpShowLevels) DrawLevels();
+      DrawFib(rates_total, startBar, time, high, low);
+      DrawAstro(rates_total, startBar, time);
       if(InpShowDash)   DashUpdate(rates_total, time, close);
    }
 
@@ -914,6 +930,137 @@ void DrawSeg(string name, datetime t1, double p1, datetime t2, double p2,
 }
 
 //+==================================================================+
+//| Удаление объектов по тегу                                         |
+//+==================================================================+
+void ClearTag(string tag)
+{
+   int total = ObjectsTotal(0,-1,-1);
+   for(int i=total-1;i>=0;--i)
+   {
+      string nm = ObjectName(0,i,-1,-1);
+      if(StringFind(nm, InpPrefix+tag)==0) ObjectDelete(0,nm);
+   }
+}
+
+//+==================================================================+
+//| Фибоначчи: авто-разметка от последнего свинг-импульса             |
+//+==================================================================+
+bool IsPivotHigh(int k, int piv, const double &high[])
+{
+   for(int j=1;j<=piv;++j)
+      if(high[k] < high[k-j] || high[k] < high[k+j]) return false;
+   return true;
+}
+bool IsPivotLow(int k, int piv, const double &low[])
+{
+   for(int j=1;j<=piv;++j)
+      if(low[k] > low[k-j] || low[k] > low[k+j]) return false;
+   return true;
+}
+
+void FibLabel(string name, datetime t, double price, string txt, color clr)
+{
+   if(ObjectFind(0,name)<0) ObjectCreate(0,name,OBJ_TEXT,0,t,price);
+   ObjectSetInteger(0,name,OBJPROP_TIME,0,t);
+   ObjectSetDouble (0,name,OBJPROP_PRICE,0,price);
+   ObjectSetString (0,name,OBJPROP_TEXT," "+txt);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,name,OBJPROP_FONTSIZE,7);
+   ObjectSetInteger(0,name,OBJPROP_ANCHOR,ANCHOR_LEFT);
+   ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
+}
+
+void DrawFib(int rt, int startBar, const datetime &time[],
+             const double &high[], const double &low[])
+{
+   ClearTag("fib_");
+   if(!InpShowFib) return;
+
+   int piv  = MathMax(1, InpFibPivot);
+   int last = rt - 1 - piv;             // последний бар, который может быть подтверждённым пивотом
+   int lo   = startBar + piv;
+   if(last <= lo) return;
+
+   int phIdx=-1, plIdx=-1;
+   for(int k=last;k>=lo;--k)
+   {
+      if(phIdx<0 && IsPivotHigh(k,piv,high)) phIdx=k;
+      if(plIdx<0 && IsPivotLow (k,piv,low )) plIdx=k;
+      if(phIdx>=0 && plIdx>=0) break;
+   }
+   if(phIdx<0 || plIdx<0) return;
+
+   bool upLeg = (phIdx > plIdx);                 // более новый пивот — хай => восходящий импульс
+   double p0  = upLeg ? low[plIdx]  : high[phIdx]; // 0%
+   double p1  = upLeg ? high[phIdx] : low[plIdx];  // 100%
+   int    aIdx= MathMin(phIdx, plIdx);             // начало импульса (старший пивот)
+
+   datetime t1 = time[aIdx];
+   datetime t2 = time[rt-1] + (datetime)((long)PeriodSeconds(_Period) * InpFibExtendBars);
+
+   double fl[] = {0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0};
+   for(int n=0;n<ArraySize(fl);++n)
+   {
+      double pr = p0 + (p1-p0)*fl[n];
+      string nm = InpPrefix+"fib_"+DoubleToString(fl[n],3);
+      ENUM_LINE_STYLE st = (fl[n]==0.5 || fl[n]==0.618) ? STYLE_SOLID : STYLE_DOT;
+      DrawSeg(nm, t1, pr, t2, pr, InpFibColor, st);
+      FibLabel(nm+"_l", t2, pr, DoubleToString(fl[n],3), InpFibColor);
+   }
+   if(InpFibShowExt)
+   {
+      double ex[] = {1.272, 1.618};
+      for(int n=0;n<ArraySize(ex);++n)
+      {
+         double pr = p0 + (p1-p0)*ex[n];
+         string nm = InpPrefix+"fib_ext_"+DoubleToString(ex[n],3);
+         DrawSeg(nm, t1, pr, t2, pr, InpFibExtColor, STYLE_DASH);
+         FibLabel(nm+"_l", t2, pr, "ext "+DoubleToString(ex[n],3), InpFibExtColor);
+      }
+   }
+}
+
+//+==================================================================+
+//| Астро-оверлей: фазы Луны (детерминированная астрономия).          |
+//| ВНИМАНИЕ: доказанного торгового перевеса у фаз Луны НЕТ.          |
+//| Метки даны только для самостоятельной визуальной проверки.       |
+//| Время событий — UTC; на графике серверное время (возможен сдвиг).|
+//+==================================================================+
+void DrawVLine(string name, datetime t, color clr)
+{
+   if(ObjectFind(0,name)<0) ObjectCreate(0,name,OBJ_VLINE,0,t,0);
+   ObjectSetInteger(0,name,OBJPROP_TIME,0,t);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_DOT);
+   ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);
+   ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
+}
+
+void DrawAstro(int rt, int startBar, const datetime &time[])
+{
+   ClearTag("moon_");
+   if(!InpShowAstro) return;
+
+   double ref = 947182440.0;   // 2000-01-06 18:14 UTC — эталонное новолуние
+   double syn = 2551442.9;     // синодический месяц, сек (~29.53 сут)
+
+   for(int i=startBar+1;i<rt;++i)
+   {
+      double gPrev = ((double)time[i-1] - ref) / syn;
+      double gCur  = ((double)time[i]   - ref) / syn;
+      // новолуние — пересечение целого значения фазы
+      if(MathFloor(gCur) != MathFloor(gPrev))
+         DrawVLine(InpPrefix+"moon_n_"+IntegerToString((long)time[i]), time[i], InpAstroNewColor);
+      // полнолуние — пересечение значения (целое+0.5)
+      if(MathFloor(gCur-0.5) != MathFloor(gPrev-0.5))
+         DrawVLine(InpPrefix+"moon_f_"+IntegerToString((long)time[i]), time[i], InpAstroFullColor);
+   }
+}
+
+//+==================================================================+
 //| Алерты                                                            |
 //+==================================================================+
 void MaybeAlert(bool buy, double entry, double sl, double tp1, double tp2, datetime t)
@@ -995,7 +1142,7 @@ void DashUpdate(int rt, const datetime &time[], const double &close[])
    DashBg(x-6, y-6, w, lines*lh+10);
 
    int yy=y;
-   DashLabel("t0", x, yy, "GoldScalperPro  v1.20", InpDashAccent, InpDashFont+1); yy+=lh+2;
+   DashLabel("t0", x, yy, "GoldScalperPro  v1.30", InpDashAccent, InpDashFont+1); yy+=lh+2;
    DashLabel("t1", x, yy, _Symbol+"  "+TFToStr(_Period)+"  ["+gSymClass+"]", InpDashText, InpDashFont); yy+=lh;
    DashLabel("t2", x, yy, "Bias:   "+bias, biasClr, InpDashFont); yy+=lh;
    DashLabel("t3", x, yy, "HTF "+TFToStr((InpHTF>_Period)?InpHTF:_Period)+": "+htfStr,
