@@ -2,13 +2,14 @@
 //|                                              GoldScalperPro.mq5   |
 //|       Intraday / Scalping signals for Gold (XAUUSD)              |
 //|       Trend EMA stack + Daily VWAP bias + RSI pullback trigger   |
-//|       + HTF trend confirm + session/vol/spread filters           |
-//|       + ATR SL with partial TP1/TP2 + win-rate & best-hours stats|
+//|       + HTF trend confirm + ATR-relative vol/spread filters      |
+//|       + partial TP1/TP2 + win-rate/best-hours + symbol profiles  |
+//|       Multi-symbol: gold, FX, indices, crypto (auto profile)     |
 //|                                            Copyright 2026 Mago201|
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 6
@@ -48,6 +49,20 @@
 //+==================================================================+
 //| ВХОДНЫЕ ПАРАМЕТРЫ                                                 |
 //+==================================================================+
+enum ENUM_GS_PROFILE
+{
+   GS_AUTO   = 0,   // Авто (определить по символу)
+   GS_CUSTOM = 1,   // Вручную (мои настройки сессии)
+   GS_GOLD   = 2,   // Золото / серебро (London+NY)
+   GS_FX     = 3,   // FX мажоры EUR/GBP/USD (London+NY)
+   GS_JPY    = 4,   // JPY/AUD/NZD (Азия+London)
+   GS_INDEX  = 5,   // Индексы US/EU (US-сессия)
+   GS_CRYPTO = 6    // Крипта (24/7, без фильтра сессии)
+};
+
+input group "=== Профиль инструмента (мульти-символьность) ==="
+input ENUM_GS_PROFILE InpProfile = GS_AUTO;  // Профиль: задаёт окно сессии под класс актива
+
 input group "=== Тренд (EMA stack) ==="
 input int    InpEmaFast      = 8;            // Быстрая EMA
 input int    InpEmaSlow      = 21;           // Средняя EMA
@@ -75,10 +90,11 @@ input group "=== Откат к EMA ==="
 input int    InpPullbackLookback = 6;        // Окно поиска отката (баров)
 input double InpPullbackATR       = 0.20;    // Допуск касания быстрой EMA (доли ATR)
 
-input group "=== Волатильность / ATR ==="
+input group "=== Волатильность / ATR (режим, символо-независимо) ==="
 input int    InpAtrPeriod    = 14;           // Период ATR
-input int    InpAtrMinPts    = 0;            // Мин. ATR в пунктах для торговли (0=выкл)
-input int    InpAtrMaxPts    = 0;            // Макс. ATR в пунктах (0=выкл; фильтр экстремальной волы)
+input int    InpAtrAvgPeriod = 100;          // Период средней ATR (базовый «нормальный» уровень)
+input double InpAtrRegimeMin = 0.0;          // Мин. ATR / средняя ATR (0=выкл; напр. 0.6 = не торговать в штиль)
+input double InpAtrRegimeMax = 0.0;          // Макс. ATR / средняя ATR (0=выкл; напр. 3.0 = не торговать на всплеске)
 
 input group "=== Риск (SL/TP) ==="
 input double InpSLATR        = 1.20;         // SL = ATR * множитель
@@ -100,9 +116,11 @@ input group "=== Авто-анализ лучших часов (по истор�
 input bool   InpShowBestHours  = true;       // Считать винрейт по часам и показывать лучшие
 input int    InpBestHoursMinTr = 5;          // Мин. сделок в часе для учёта
 input int    InpBestHoursTopN  = 4;          // Сколько лучших часов показать в панели
+input bool   InpAutoHoursApply = false;      // Автоматически торговать ТОЛЬКО в лучших часах (вместо окна сессии)
+input double InpAutoHoursMinWR = 50.0;       // Порог винрейта часа для авто-допуска (%)
 
 input group "=== Прочие фильтры ==="
-input int    InpMaxSpreadPts = 0;            // Макс. спред в пунктах (0=выкл; для live)
+input double InpMaxSpreadATR = 0.0;          // Макс. спред в долях ATR (0=выкл; напр. 0.15 = 15% ATR). Символо-независимо
 input int    InpCooldownBars = 3;            // Пауза между сигналами одного направления (баров)
 input double InpMinDistATR   = 0.0;          // Мин. дистанция от прошлого сигнала (ATR; 0=выкл)
 
@@ -134,7 +152,6 @@ input int              InpStatMaxFwd = 300;            // Макс. баров �
 
 input group "=== Производительность / прочее ==="
 input int    InpMaxBars      = 2500;         // Глубина анализа (баров; 0 = вся история)
-input bool   InpSymbolGuard  = true;         // Предупреждать, если символ не похож на золото
 input string InpPrefix       = "GSP_";       // Префикс объектов
 
 //+==================================================================+
@@ -149,6 +166,7 @@ double BufVWAP[];
 
 double gRsi[];
 double gAtr[];
+double gAtrAvg[];           // средняя ATR (базовый уровень волатильности для режимного фильтра)
 double gHtfEma[];            // EMA старшего ТФ, выровненная по барам текущего ТФ
 
 int    hEmaF = INVALID_HANDLE;
@@ -173,6 +191,13 @@ double   gBuyCnt=0, gSellCnt=0;
 int      gTp2Hits=0;          // сколько сделок дошли до TP2
 int      gHourWins[24];       // винрейт по часам (для авто-анализа лучших часов)
 int      gHourLosses[24];
+bool     gHourAllowed[24];    // часы, разрешённые авто-режимом (InpAutoHoursApply)
+
+// Эффективный профиль/сессия (рассчитывается из InpProfile)
+int      gSessStart = 0;
+int      gSessEnd   = 24;
+bool     gUseSession = true;
+string   gSymClass  = "custom";
 
 // Для отрисовки SL/TP последних сигналов
 datetime gSigTime[];
@@ -202,6 +227,7 @@ int OnInit()
    ArraySetAsSeries(BufVWAP, false);
    ArraySetAsSeries(gRsi,    false);
    ArraySetAsSeries(gAtr,    false);
+   ArraySetAsSeries(gAtrAvg, false);
    ArraySetAsSeries(gHtfEma, false);
 
    PlotIndexSetInteger(0, PLOT_ARROW, InpBuyArrow);
@@ -250,12 +276,11 @@ int OnInit()
    ArrayResize(gSigTP2,0);
    ArrayInitialize(gHourWins, 0);
    ArrayInitialize(gHourLosses, 0);
+   ArrayInitialize(gHourAllowed, 0);
+
+   SetupProfile();   // эффективная сессия по профилю инструмента
 
    ClearAll();
-   if(InpSymbolGuard && !LooksLikeGold())
-      Comment("GoldScalperPro: символ '", _Symbol,
-              "' не похож на золото. Индикатор рассчитан под XAUUSD/GOLD.");
-
    return(INIT_SUCCEEDED);
 }
 
@@ -271,11 +296,49 @@ void OnDeinit(const int reason)
    Comment("");
 }
 
-bool LooksLikeGold()
+// Определение класса инструмента по имени символа
+int DetectProfile()
 {
    string s = _Symbol;
    StringToUpper(s);
-   return(StringFind(s,"XAU")>=0 || StringFind(s,"GOLD")>=0 || StringFind(s,"GLD")>=0);
+   if(StringFind(s,"XAU")>=0 || StringFind(s,"GOLD")>=0 || StringFind(s,"GLD")>=0 ||
+      StringFind(s,"XAG")>=0 || StringFind(s,"SILVER")>=0)
+      return GS_GOLD;
+   if(StringFind(s,"BTC")>=0 || StringFind(s,"ETH")>=0 || StringFind(s,"USDT")>=0 ||
+      StringFind(s,"CRYPTO")>=0 || StringFind(s,"XRP")>=0 || StringFind(s,"SOL")>=0)
+      return GS_CRYPTO;
+   if(StringFind(s,"US30")>=0 || StringFind(s,"US500")>=0 || StringFind(s,"SPX")>=0 ||
+      StringFind(s,"NAS")>=0 || StringFind(s,"NDX")>=0 || StringFind(s,"DAX")>=0 ||
+      StringFind(s,"GER")>=0 || StringFind(s,"UK100")>=0 || StringFind(s,"JP225")>=0 ||
+      StringFind(s,"US100")>=0 || StringFind(s,"USTEC")>=0)
+      return GS_INDEX;
+   if(StringFind(s,"JPY")>=0 || StringFind(s,"AUD")>=0 || StringFind(s,"NZD")>=0)
+      return GS_JPY;
+   return GS_FX;
+}
+
+// Расчёт эффективной сессии по выбранному/определённому профилю
+void SetupProfile()
+{
+   // по умолчанию — пользовательские настройки (CUSTOM)
+   gUseSession = InpUseSession;
+   gSessStart  = InpSessStartHour;
+   gSessEnd    = InpSessEndHour;
+   gSymClass   = "custom";
+
+   int prof = InpProfile;
+   if(prof == GS_CUSTOM) return;
+   if(prof == GS_AUTO)   prof = DetectProfile();
+
+   switch(prof)
+   {
+      case GS_GOLD:   gSymClass="gold";   gUseSession=true;  gSessStart=8;  gSessEnd=21; break;
+      case GS_FX:     gSymClass="fx";     gUseSession=true;  gSessStart=7;  gSessEnd=20; break;
+      case GS_JPY:    gSymClass="jpy/asia";gUseSession=true; gSessStart=0;  gSessEnd=16; break;
+      case GS_INDEX:  gSymClass="index";  gUseSession=true;  gSessStart=13; gSessEnd=21; break;
+      case GS_CRYPTO: gSymClass="crypto"; gUseSession=false; gSessStart=0;  gSessEnd=24; break;
+      default: break;
+   }
 }
 
 void ClearAll()
@@ -403,8 +466,14 @@ void RecomputeSignals(int rt, int startBar,
    // выровнять EMA старшего ТФ по барам текущего ТФ
    BuildHtfEma(rt, startBar, time);
 
+   // средняя ATR (для режимного фильтра волатильности)
+   BuildAtrAvg(rt, startBar);
+
    // винрейт по часам — по «сырым» сигналам (без сессии/cooldown), для подсказки лучших часов
    AccumulateHourStats(rt, startBar, time, open, high, low, close, spread);
+
+   // если включён авто-режим — определить разрешённые часы
+   ComputeAllowedHours();
 
    int lastClosed = rt - 2;        // последний полностью закрытый бар
    if(lastClosed < startBar) return;
@@ -417,8 +486,8 @@ void RecomputeSignals(int rt, int startBar,
 
       double atr = gAtr[i];
 
-      // --- фильтр сессии ---
-      if(InpUseSession && !InSession(time[i])) continue;
+      // --- фильтр времени (профиль/сессия или авто-часы) ---
+      if(!SessionAllowed(time[i])) continue;
 
       // --- cooldown / min distance ---
       if(dir>0)
@@ -472,11 +541,20 @@ int EvalSignal(int i, int startBar,
    entry=0; sl=0; tp1=0; tp2=0;
    double atr = gAtr[i];
    if(atr <= 0.0) return 0;
-   double point = _Point;
 
-   if(InpAtrMinPts>0 && atr < InpAtrMinPts*point) return 0;
-   if(InpAtrMaxPts>0 && atr > InpAtrMaxPts*point) return 0;
-   if(InpMaxSpreadPts>0 && spread[i] > InpMaxSpreadPts) return 0;
+   // режимный фильтр волатильности: ATR относительно своей средней (символо-независимо)
+   if(InpAtrRegimeMin>0.0 || InpAtrRegimeMax>0.0)
+   {
+      double avg = (i<ArraySize(gAtrAvg)) ? gAtrAvg[i] : 0.0;
+      if(avg>0.0)
+      {
+         double ratio = atr/avg;
+         if(InpAtrRegimeMin>0.0 && ratio < InpAtrRegimeMin) return 0;
+         if(InpAtrRegimeMax>0.0 && ratio > InpAtrRegimeMax) return 0;
+      }
+   }
+   // спред-фильтр в долях ATR (символо-независимо)
+   if(InpMaxSpreadATR>0.0 && ((double)spread[i]*_Point) > InpMaxSpreadATR*atr) return 0;
 
    // тренд (EMA stack)
    bool up   = (BufEmaF[i] > BufEmaS[i] && BufEmaS[i] > BufEmaT[i]);
@@ -738,10 +816,50 @@ bool InSession(datetime t)
 {
    MqlDateTime mt; TimeToStruct(t, mt);
    int h = mt.hour;
-   int s = InpSessStartHour, e = InpSessEndHour;
+   int s = gSessStart, e = gSessEnd;
    if(s == e) return(true);                 // окно 24ч
    if(s < e)  return(h >= s && h < e);       // обычное окно
    return(h >= s || h < e);                  // окно через полночь
+}
+
+// Допуск по времени: авто-режим лучших часов ИЛИ окно сессии профиля
+bool SessionAllowed(datetime t)
+{
+   if(InpAutoHoursApply)
+   {
+      MqlDateTime mt; TimeToStruct(t, mt);
+      return gHourAllowed[mt.hour];
+   }
+   if(!gUseSession) return true;
+   return InSession(t);
+}
+
+// Сформировать список разрешённых часов из почасовой статистики
+void ComputeAllowedHours()
+{
+   for(int h=0;h<24;++h) gHourAllowed[h]=false;
+   if(!InpAutoHoursApply) return;
+   for(int h=0;h<24;++h)
+   {
+      int t = gHourWins[h] + gHourLosses[h];
+      if(t >= InpBestHoursMinTr && (100.0*gHourWins[h]/t) >= InpAutoHoursMinWR)
+         gHourAllowed[h] = true;
+   }
+}
+
+// Средняя ATR (бегущее среднее) — базовый уровень для режимного фильтра
+void BuildAtrAvg(int rt, int startBar)
+{
+   if(ArraySize(gAtrAvg)!=rt) ArrayResize(gAtrAvg, rt);
+   int p = MathMax(2, InpAtrAvgPeriod);
+   double run=0.0;
+   for(int i=0;i<rt;++i)
+   {
+      run += gAtr[i];
+      if(i>=p) run -= gAtr[i-p];
+      int denom = (i+1<p) ? (i+1) : p;
+      gAtrAvg[i] = (denom>0) ? run/denom : gAtr[i];
+   }
 }
 
 //+==================================================================+
@@ -857,25 +975,34 @@ void DashUpdate(int rt, const datetime &time[], const double &close[])
       else        htfStr = (close[i]>he) ? "BULL" : "BEAR";
    }
 
-   bool sess = (!InpUseSession) || InSession(time[i]);
+   bool   sess = SessionAllowed(time[i]);
+   string sessStr;
+   if(InpAutoHoursApply)        sessStr = "Time: auto-hours"+(sess?" OK":" -");
+   else if(gUseSession)         sessStr = "Sess "+IntegerToString(gSessStart)+"-"+IntegerToString(gSessEnd)+
+                                          (sess?" OPEN":" closed");
+   else                         sessStr = "Sess: off (24h)";
+
+   double avg = (i<ArraySize(gAtrAvg)) ? gAtrAvg[i] : 0.0;
+   double regime = (avg>0.0) ? atr/avg : 0.0;
+
    long spr  = (long)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    string tpStr = InpUsePartialTP
                   ? ("TP "+DoubleToString(InpRR1,1)+"/"+DoubleToString(InpRR2,1))
                   : ("RR "+DoubleToString(InpRR,2));
 
-   int x=InpDashX, y=InpDashY, lh=InpDashFont+7, w=250;
+   int x=InpDashX, y=InpDashY, lh=InpDashFont+7, w=255;
    int lines=15;
    DashBg(x-6, y-6, w, lines*lh+10);
 
    int yy=y;
-   DashLabel("t0", x, yy, "GoldScalperPro  v1.10", InpDashAccent, InpDashFont+1); yy+=lh+2;
-   DashLabel("t1", x, yy, _Symbol+"  "+TFToStr(_Period), InpDashText, InpDashFont); yy+=lh;
+   DashLabel("t0", x, yy, "GoldScalperPro  v1.20", InpDashAccent, InpDashFont+1); yy+=lh+2;
+   DashLabel("t1", x, yy, _Symbol+"  "+TFToStr(_Period)+"  ["+gSymClass+"]", InpDashText, InpDashFont); yy+=lh;
    DashLabel("t2", x, yy, "Bias:   "+bias, biasClr, InpDashFont); yy+=lh;
    DashLabel("t3", x, yy, "HTF "+TFToStr((InpHTF>_Period)?InpHTF:_Period)+": "+htfStr,
              InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t4", x, yy, "Session:"+(sess?" OPEN":" closed"),
-             sess?clrLime:clrGray, InpDashFont); yy+=lh;
-   DashLabel("t5", x, yy, "ATR:    "+DoubleToString(atr/_Point,0)+" pts", InpDashText, InpDashFont); yy+=lh;
+   DashLabel("t4", x, yy, sessStr, sess?clrLime:clrGray, InpDashFont); yy+=lh;
+   DashLabel("t5", x, yy, "ATR: "+DoubleToString(atr/_Point,0)+" pts  (x"+DoubleToString(regime,2)+")",
+             InpDashText, InpDashFont); yy+=lh;
    DashLabel("t6", x, yy, "Spread: "+IntegerToString(spr)+" pts   "+tpStr, InpDashText, InpDashFont); yy+=lh;
    DashLabel("t7", x, yy, "------- stats (hist) -------", InpDashAccent, InpDashFont); yy+=lh;
    DashLabel("t8", x, yy, "Signals:"+IntegerToString(gSigTotal)+
@@ -888,7 +1015,7 @@ void DashUpdate(int rt, const datetime &time[], const double &close[])
    DashLabel("t11",x, yy, "Profit f:"+DoubleToString(pf,2)+
              (InpUsePartialTP?("   TP2:"+IntegerToString(gTp2Hits)):""), InpDashText, InpDashFont); yy+=lh;
    DashLabel("t12",x, yy, "Expectancy:"+DoubleToString(expR,3)+" R", InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t13",x, yy, "------- best hours -------", InpDashAccent, InpDashFont); yy+=lh;
+   DashLabel("t13",x, yy, "----- best hours (raw) -----", InpDashAccent, InpDashFont); yy+=lh;
    DashLabel("t14",x, yy, InpShowBestHours?BestHoursStr():"off", clrAqua, InpDashFont);
 }
 
