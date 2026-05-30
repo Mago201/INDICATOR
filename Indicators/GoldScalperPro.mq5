@@ -4,13 +4,13 @@
 //|       Trend EMA stack + Daily VWAP bias + RSI pullback trigger   |
 //|       + HTF trend confirm + ATR-relative vol/spread filters      |
 //|       + partial TP1/TP2 + win-rate/best-hours + symbol profiles  |
-//|       + Fibonacci levels + lunar-phase overlay (no proven edge)  |
-//|       Multi-symbol: gold, FX, indices, crypto (auto profile)     |
+//|       + Fibonacci levels + lunar overlay + out-of-sample test     |
+//|       + risk-% position sizing.  Multi-symbol (auto profile)     |
 //|                                            Copyright 2026 Mago201|
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.30"
+#property version   "1.40"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 6
@@ -140,6 +140,16 @@ input group "=== Алерты ==="
 input bool   InpAlert        = true;         // Popup/звуковой алерт на свежем сигнале
 input bool   InpAlertPush    = false;        // Push-уведомление (SendNotification)
 
+input group "=== Forward-test (out-of-sample проверка) ==="
+input bool   InpOOSEnable    = false;        // Делить историю: обучение (IS) + «невиданная» проверка (OOS)
+input int    InpOOSPercent   = 30;           // Доля свежей истории под OOS, % (лучшие часы учатся только на IS)
+
+input group "=== Калькулятор размера позиции (риск %) ==="
+input bool   InpShowPosSize     = true;      // Показывать рекомендуемый лот по риску
+input double InpRiskPercent     = 1.0;       // Риск на сделку, % от баланса/эквити
+input bool   InpRiskUseEquity   = false;     // Брать эквити вместо баланса
+input double InpAccountOverride = 0.0;       // Гипотетический депозит (0 = реальный счёт)
+
 input group "=== Фибоначчи (авто-разметка от свинга) ==="
 input bool   InpShowFib       = true;        // Авто-уровни Фибоначчи от последнего свинг-импульса
 input int    InpFibPivot      = 5;           // Окно пивота (баров слева/справа для свинга)
@@ -197,12 +207,11 @@ int      gLastSellBar  = -100000;
 double   gLastBuyPrice = 0.0;
 double   gLastSellPrice= 0.0;
 
-// Статистика по истории
-int      gSigTotal=0, gWins=0, gLosses=0, gOpen=0;
-double   gSumR=0.0;           // суммарный результат в R
-double   gGrossWin=0.0, gGrossLoss=0.0;  // для profit factor (в R)
-double   gBuyCnt=0, gSellCnt=0;
-int      gTp2Hits=0;          // сколько сделок дошли до TP2
+// Статистика по истории — по сегментам: [0]=In-Sample (обучение), [1]=Out-of-Sample (forward)
+// Когда forward-test выключен, всё попадает в сегмент 0 («ALL»).
+int      gSegSig[2],  gSegWin[2],  gSegLoss[2], gSegOpen[2], gSegTp2[2], gSegBuy[2], gSegSell[2];
+double   gSegSumR[2], gSegGWin[2], gSegGLoss[2];
+int      gSplitBar = 0;       // граница IS/OOS (бары < gSplitBar = IS)
 int      gHourWins[24];       // винрейт по часам (для авто-анализа лучших часов)
 int      gHourLosses[24];
 bool     gHourAllowed[24];    // часы, разрешённые авто-режимом (InpAutoHoursApply)
@@ -469,9 +478,12 @@ void RecomputeSignals(int rt, int startBar,
                       const double &high[], const double &low[],
                       const double &close[], const int &spread[])
 {
-   // сброс статистики
-   gSigTotal=0; gWins=0; gLosses=0; gOpen=0;
-   gSumR=0.0; gGrossWin=0.0; gGrossLoss=0.0; gBuyCnt=0; gSellCnt=0; gTp2Hits=0;
+   // сброс статистики (оба сегмента)
+   for(int s=0;s<2;++s)
+   {
+      gSegSig[s]=0; gSegWin[s]=0; gSegLoss[s]=0; gSegOpen[s]=0; gSegTp2[s]=0;
+      gSegBuy[s]=0; gSegSell[s]=0; gSegSumR[s]=0.0; gSegGWin[s]=0.0; gSegGLoss[s]=0.0;
+   }
    gLastBuyBar=-100000; gLastSellBar=-100000; gLastBuyPrice=0; gLastSellPrice=0;
    ArrayResize(gSigTime,0); ArrayResize(gSigEntry,0);
    ArrayResize(gSigSL,0);   ArrayResize(gSigTP,0);
@@ -485,14 +497,23 @@ void RecomputeSignals(int rt, int startBar,
    // средняя ATR (для режимного фильтра волатильности)
    BuildAtrAvg(rt, startBar);
 
-   // винрейт по часам — по «сырым» сигналам (без сессии/cooldown), для подсказки лучших часов
-   AccumulateHourStats(rt, startBar, time, open, high, low, close, spread);
-
-   // если включён авто-режим — определить разрешённые часы
-   ComputeAllowedHours();
-
    int lastClosed = rt - 2;        // последний полностью закрытый бар
    if(lastClosed < startBar) return;
+
+   // граница In-Sample / Out-of-Sample (forward-test)
+   if(InpOOSEnable && InpOOSPercent>0 && InpOOSPercent<100)
+   {
+      int usable = lastClosed - startBar + 1;
+      gSplitBar  = startBar + (int)((double)usable * (100.0 - InpOOSPercent) / 100.0);
+   }
+   else
+      gSplitBar = lastClosed + 1;   // всё = In-Sample (сегмент 0)
+
+   // винрейт по часам — ТОЛЬКО на In-Sample части (обучение «лучших часов»)
+   AccumulateHourStats(startBar, time, open, high, low, close, spread, rt);
+
+   // если включён авто-режим — определить разрешённые часы (из IS)
+   ComputeAllowedHours();
 
    for(int i=startBar;i<=lastClosed;++i)
    {
@@ -527,16 +548,17 @@ void RecomputeSignals(int rt, int startBar,
          else      BufSell[i] = high[i] + off;
       }
 
-      gSigTotal++;
-      if(dir>0){ gBuyCnt++; gLastBuyBar=i; gLastBuyPrice=entry; }
-      else     { gSellCnt++; gLastSellBar=i; gLastSellPrice=entry; }
+      int seg = (i < gSplitBar) ? 0 : 1;
+      gSegSig[seg]++;
+      if(dir>0){ gSegBuy[seg]++;  gLastBuyBar=i;  gLastBuyPrice=entry; }
+      else     { gSegSell[seg]++; gLastSellBar=i; gLastSellPrice=entry; }
 
       // --- forward-test (одиночный TP или TP1/TP2 с переводом в БУ) ---
       double rMult; bool tp2hit;
       int outcome = ForwardOutcome(i, rt, dir, entry, sl, tp1, tp2, high, low, rMult, tp2hit);
-      if(outcome==1){ gWins++;  gGrossWin += rMult; gSumR += rMult; if(tp2hit) gTp2Hits++; }
-      else if(outcome==-1){ gLosses++; gGrossLoss += (-rMult); gSumR += rMult; }
-      else gOpen++;
+      if(outcome==1){ gSegWin[seg]++;  gSegGWin[seg] += rMult; gSegSumR[seg] += rMult; if(tp2hit) gSegTp2[seg]++; }
+      else if(outcome==-1){ gSegLoss[seg]++; gSegGLoss[seg] += (-rMult); gSegSumR[seg] += rMult; }
+      else gSegOpen[seg]++;
 
       // --- сохранить для отрисовки SL/TP ---
       PushSignal(time[i], entry, sl, tp1, tp2, dir);
@@ -750,18 +772,19 @@ void BuildHtfEma(int rt, int startBar, const datetime &time[])
 }
 
 // Винрейт по часам — по «сырым» сигналам (без фильтра сессии/cooldown),
-// чтобы подсказать лучшие часы для торговли.
-void AccumulateHourStats(int rt, int startBar,
+// ТОЛЬКО на In-Sample части (до gSplitBar). Так «лучшие часы» учатся на обучающих данных,
+// а Out-of-Sample остаётся «невиданным» для честной проверки.
+void AccumulateHourStats(int startBar,
                          const datetime &time[], const double &open[],
                          const double &high[], const double &low[],
-                         const double &close[], const int &spread[])
+                         const double &close[], const int &spread[], int rt)
 {
    ArrayInitialize(gHourWins, 0);
    ArrayInitialize(gHourLosses, 0);
    if(!InpShowBestHours) return;
 
-   int lastClosed = rt - 2;
-   for(int i=startBar;i<=lastClosed;++i)
+   int isEnd = gSplitBar - 1;          // конец In-Sample
+   for(int i=startBar;i<=isEnd;++i)
    {
       double e, sl, tp1, tp2;
       int dir = EvalSignal(i, startBar, time, open, high, low, close, spread, e, sl, tp1, tp2);
@@ -1089,81 +1112,135 @@ string TFToStr(ENUM_TIMEFRAMES tf)
 }
 
 //+==================================================================+
+//| Калькулятор размера позиции по риску %                            |
+//+==================================================================+
+double AccountBase()
+{
+   if(InpAccountOverride > 0.0) return InpAccountOverride;
+   return AccountInfoDouble(InpRiskUseEquity ? ACCOUNT_EQUITY : ACCOUNT_BALANCE);
+}
+
+void CalcLots(double slDist, double &riskMoney, double &lots, string &note)
+{
+   riskMoney = 0.0; lots = 0.0; note = "";
+   double base = AccountBase();
+   riskMoney = base * InpRiskPercent / 100.0;
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize<=0.0 || tickVal<=0.0 || slDist<=0.0){ note="n/a"; return; }
+   double lossPerLot = (slDist / tickSize) * tickVal;
+   if(lossPerLot<=0.0){ note="n/a"; return; }
+   lots = riskMoney / lossPerLot;
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(step>0.0) lots = MathFloor(lots/step)*step;
+   if(minL>0.0 && lots<minL){ lots=minL; note="<min: риск > "+DoubleToString(InpRiskPercent,1)+"%"; }
+   if(maxL>0.0 && lots>maxL){ lots=maxL; note="макс. лот"; }
+}
+
+// Метрики сегмента: 0=In-Sample, 1=Out-of-Sample
+void SegMetrics(int s, double &wr, double &pf, double &ex, int &sig)
+{
+   int wl = gSegWin[s] + gSegLoss[s];
+   sig = gSegSig[s];
+   wr  = wl>0 ? 100.0*gSegWin[s]/wl : 0.0;
+   pf  = gSegGLoss[s]>0.0 ? gSegGWin[s]/gSegGLoss[s] : (gSegGWin[s]>0.0?999.0:0.0);
+   ex  = wl>0 ? gSegSumR[s]/wl : 0.0;
+}
+
+void AddLine(string &t[], color &c[], int &f[], int &n, string txt, color clr, int fs)
+{
+   t[n]=txt; c[n]=clr; f[n]=fs; n++;
+}
+
+//+==================================================================+
 //| Dashboard                                                         |
 //+==================================================================+
 void DashUpdate(int rt, const datetime &time[], const double &close[])
 {
+   ClearTag("dash_");
    int i = rt-1;
    double atr = gAtr[i];
-   double winrate = (gWins+gLosses>0) ? (100.0*gWins/(gWins+gLosses)) : 0.0;
-   double pf = (gGrossLoss>0.0) ? (gGrossWin/gGrossLoss) : (gGrossWin>0.0?999.0:0.0);
-   double expR = (gWins+gLosses>0) ? (gSumR/(gWins+gLosses)) : 0.0;
 
    // bias текущего ТФ
-   string bias = "FLAT";
-   color  biasClr = InpDashText;
+   string bias="FLAT"; color biasClr=InpDashText;
    bool up   = (BufEmaF[i]>BufEmaS[i] && BufEmaS[i]>BufEmaT[i]);
    bool down = (BufEmaF[i]<BufEmaS[i] && BufEmaS[i]<BufEmaT[i]);
    double vw = BufVWAP[i];
-   if(InpUseVWAP && vw!=EMPTY_VALUE)
-   {
-      up   = up   && close[i]>vw;
-      down = down && close[i]<vw;
-   }
+   if(InpUseVWAP && vw!=EMPTY_VALUE){ up=up&&close[i]>vw; down=down&&close[i]<vw; }
    if(up){ bias="BULL"; biasClr=clrLime; }
    else if(down){ bias="BEAR"; biasClr=clrTomato; }
 
-   // HTF bias
-   string htfStr = "off";
-   if(InpUseHTF)
+   string htfStr="off";
+   if(InpUseHTF){ double he=(i<ArraySize(gHtfEma))?gHtfEma[i]:0.0; htfStr = (he<=0.0)?"...":(close[i]>he?"BULL":"BEAR"); }
+
+   bool sess = SessionAllowed(time[i]);
+   string sessStr;
+   if(InpAutoHoursApply) sessStr="Time: auto-hours"+(sess?" OK":" -");
+   else if(gUseSession)  sessStr="Sess "+IntegerToString(gSessStart)+"-"+IntegerToString(gSessEnd)+(sess?" OPEN":" closed");
+   else                  sessStr="Sess: off (24h)";
+
+   double avg=(i<ArraySize(gAtrAvg))?gAtrAvg[i]:0.0;
+   double regime=(avg>0.0)?atr/avg:0.0;
+   long spr=(long)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   string tpStr = InpUsePartialTP ? ("TP "+DoubleToString(InpRR1,1)+"/"+DoubleToString(InpRR2,1)) : ("RR "+DoubleToString(InpRR,2));
+
+   string t[64]; color c[64]; int f[64]; int n=0;
+   int FB=InpDashFont, FBig=InpDashFont+1;
+
+   AddLine(t,c,f,n, "GoldScalperPro  v1.40", InpDashAccent, FBig);
+   AddLine(t,c,f,n, _Symbol+"  "+TFToStr(_Period)+"  ["+gSymClass+"]", InpDashText, FB);
+   AddLine(t,c,f,n, "Bias:   "+bias, biasClr, FB);
+   AddLine(t,c,f,n, "HTF "+TFToStr((InpHTF>_Period)?InpHTF:_Period)+": "+htfStr, InpDashText, FB);
+   AddLine(t,c,f,n, sessStr, sess?clrLime:clrGray, FB);
+   AddLine(t,c,f,n, "ATR: "+DoubleToString(atr/_Point,0)+" pts  (x"+DoubleToString(regime,2)+")", InpDashText, FB);
+   AddLine(t,c,f,n, "Spread: "+IntegerToString(spr)+" pts   "+tpStr, InpDashText, FB);
+
+   // позиция по риску
+   if(InpShowPosSize)
    {
-      double he = (i<ArraySize(gHtfEma)) ? gHtfEma[i] : 0.0;
-      if(he<=0.0) htfStr = "...";
-      else        htfStr = (close[i]>he) ? "BULL" : "BEAR";
+      int ns=ArraySize(gSigTime);
+      double slDist, entryPx;
+      if(ns>0){ entryPx=gSigEntry[ns-1]; slDist=MathAbs(gSigEntry[ns-1]-gSigSL[ns-1]); }
+      else    { entryPx=close[i]; slDist=InpSLATR*atr; }
+      double rm, lots; string note;
+      CalcLots(slDist, rm, lots, note);
+      AddLine(t,c,f,n, "--- позиция (риск "+DoubleToString(InpRiskPercent,1)+"%) ---", InpDashAccent, FB);
+      AddLine(t,c,f,n, "Лот: "+DoubleToString(lots,2)+(note!=""?("  "+note):""), clrAqua, FB);
+      AddLine(t,c,f,n, "SL "+DoubleToString(slDist/_Point,0)+" pts  риск ~"+DoubleToString(rm,2), InpDashText, FB);
    }
 
-   bool   sess = SessionAllowed(time[i]);
-   string sessStr;
-   if(InpAutoHoursApply)        sessStr = "Time: auto-hours"+(sess?" OK":" -");
-   else if(gUseSession)         sessStr = "Sess "+IntegerToString(gSessStart)+"-"+IntegerToString(gSessEnd)+
-                                          (sess?" OPEN":" closed");
-   else                         sessStr = "Sess: off (24h)";
+   // статистика (по сегментам)
+   double wr0,pf0,ex0; int sig0; SegMetrics(0,wr0,pf0,ex0,sig0);
+   if(!InpOOSEnable)
+   {
+      color wc=(wr0>=60.0)?clrLime:((wr0>=50.0)?InpDashAccent:clrTomato);
+      AddLine(t,c,f,n, "------- stats (hist) -------", InpDashAccent, FB);
+      AddLine(t,c,f,n, "Signals:"+IntegerToString(sig0)+"  (B"+IntegerToString(gSegBuy[0])+"/S"+IntegerToString(gSegSell[0])+")", InpDashText, FB);
+      AddLine(t,c,f,n, "Win/Loss:"+IntegerToString(gSegWin[0])+"/"+IntegerToString(gSegLoss[0])+"  open "+IntegerToString(gSegOpen[0]), InpDashText, FB);
+      AddLine(t,c,f,n, "Win-rate: "+DoubleToString(wr0,1)+"%", wc, FBig);
+      AddLine(t,c,f,n, "Profit f: "+DoubleToString(pf0,2)+(InpUsePartialTP?("  TP2:"+IntegerToString(gSegTp2[0])):""), InpDashText, FB);
+      AddLine(t,c,f,n, "Expectancy: "+DoubleToString(ex0,3)+" R", InpDashText, FB);
+   }
+   else
+   {
+      double wr1,pf1,ex1; int sig1; SegMetrics(1,wr1,pf1,ex1,sig1);
+      color wc1=(wr1>=60.0)?clrLime:((wr1>=50.0)?InpDashAccent:clrTomato);
+      AddLine(t,c,f,n, "-- IS обучение "+IntegerToString(100-InpOOSPercent)+"% --", InpDashAccent, FB);
+      AddLine(t,c,f,n, "WR "+DoubleToString(wr0,1)+"%  sig "+IntegerToString(sig0)+"  exp "+DoubleToString(ex0,2)+"R", clrSilver, FB);
+      AddLine(t,c,f,n, "== OOS forward "+IntegerToString(InpOOSPercent)+"% ==", InpDashAccent, FBig);
+      AddLine(t,c,f,n, "Win-rate: "+DoubleToString(wr1,1)+"%  (sig "+IntegerToString(sig1)+")", wc1, FBig);
+      AddLine(t,c,f,n, "PF "+DoubleToString(pf1,2)+"  exp "+DoubleToString(ex1,3)+"R"+(InpUsePartialTP?("  TP2:"+IntegerToString(gSegTp2[1])):""), InpDashText, FB);
+   }
 
-   double avg = (i<ArraySize(gAtrAvg)) ? gAtrAvg[i] : 0.0;
-   double regime = (avg>0.0) ? atr/avg : 0.0;
+   AddLine(t,c,f,n, "--- best hours (IS, raw) ---", InpDashAccent, FB);
+   AddLine(t,c,f,n, InpShowBestHours?BestHoursStr():"off", clrAqua, FB);
 
-   long spr  = (long)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   string tpStr = InpUsePartialTP
-                  ? ("TP "+DoubleToString(InpRR1,1)+"/"+DoubleToString(InpRR2,1))
-                  : ("RR "+DoubleToString(InpRR,2));
-
-   int x=InpDashX, y=InpDashY, lh=InpDashFont+7, w=255;
-   int lines=15;
-   DashBg(x-6, y-6, w, lines*lh+10);
-
-   int yy=y;
-   DashLabel("t0", x, yy, "GoldScalperPro  v1.30", InpDashAccent, InpDashFont+1); yy+=lh+2;
-   DashLabel("t1", x, yy, _Symbol+"  "+TFToStr(_Period)+"  ["+gSymClass+"]", InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t2", x, yy, "Bias:   "+bias, biasClr, InpDashFont); yy+=lh;
-   DashLabel("t3", x, yy, "HTF "+TFToStr((InpHTF>_Period)?InpHTF:_Period)+": "+htfStr,
-             InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t4", x, yy, sessStr, sess?clrLime:clrGray, InpDashFont); yy+=lh;
-   DashLabel("t5", x, yy, "ATR: "+DoubleToString(atr/_Point,0)+" pts  (x"+DoubleToString(regime,2)+")",
-             InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t6", x, yy, "Spread: "+IntegerToString(spr)+" pts   "+tpStr, InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t7", x, yy, "------- stats (hist) -------", InpDashAccent, InpDashFont); yy+=lh;
-   DashLabel("t8", x, yy, "Signals:"+IntegerToString(gSigTotal)+
-             "  (B"+IntegerToString((int)gBuyCnt)+"/S"+IntegerToString((int)gSellCnt)+")",
-             InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t9", x, yy, "Win/Loss:"+IntegerToString(gWins)+"/"+IntegerToString(gLosses)+
-             "  open "+IntegerToString(gOpen), InpDashText, InpDashFont); yy+=lh;
-   color wrClr = (winrate>=60.0)?clrLime:((winrate>=50.0)?InpDashAccent:clrTomato);
-   DashLabel("t10",x, yy, "Win-rate:"+DoubleToString(winrate,1)+"%", wrClr, InpDashFont+1); yy+=lh;
-   DashLabel("t11",x, yy, "Profit f:"+DoubleToString(pf,2)+
-             (InpUsePartialTP?("   TP2:"+IntegerToString(gTp2Hits)):""), InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t12",x, yy, "Expectancy:"+DoubleToString(expR,3)+" R", InpDashText, InpDashFont); yy+=lh;
-   DashLabel("t13",x, yy, "----- best hours (raw) -----", InpDashAccent, InpDashFont); yy+=lh;
-   DashLabel("t14",x, yy, InpShowBestHours?BestHoursStr():"off", clrAqua, InpDashFont);
+   int lh=InpDashFont+7, w=270;
+   DashBg(InpDashX-6, InpDashY-6, w, n*lh+12);
+   int yy=InpDashY;
+   for(int k=0;k<n;++k){ DashLabel("L"+IntegerToString(k), InpDashX, yy, t[k], c[k], f[k]); yy+=lh; }
 }
 
 void DashBg(int x,int y,int w,int h)
