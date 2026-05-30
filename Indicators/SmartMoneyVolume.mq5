@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.30"
+#property version   "1.31"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 4
@@ -64,6 +64,37 @@ input int      InpFVGExtendBars    = 20;
 input group "=== Liquidity Sweeps ==="
 input bool     InpShowLiquidity    = true;
 input color    InpLiquidityColor   = clrGold;
+
+input group "=== Liquidity Levels (зоны ликвидности) ==="
+input bool            InpLiqLevelsEnable  = true;            // Включить зоны ликвидности
+input bool            InpLiqShowLines     = true;            // Линии ликвидности от свингов (BSL/SSL)
+input color           InpLiqBuyColor      = clrDeepSkyBlue;  // Цвет BSL (над максимумами)
+input color           InpLiqSellColor     = clrTomato;       // Цвет SSL (под минимумами)
+input ENUM_LINE_STYLE InpLiqLineStyle     = STYLE_DOT;       // Стиль линий ликвидности
+input int             InpLiqLineWidth     = 1;               // Толщина линий ликвидности
+input int             InpLiqMaxPerSide    = 8;               // Макс. активных линий на сторону
+input bool            InpLiqRemoveOnSweep = false;           // Удалять линию при снятии (иначе затемнять)
+input color           InpLiqSweptColor    = clrDimGray;      // Цвет снятой ликвидности
+input bool            InpLiqShowLabels    = true;            // Подписи у линий (BSL/SSL/EQH/EQL)
+input bool            InpLiqExtendActive  = true;            // Тянуть активные линии вправо (ray)
+
+input bool            InpLiqShowEqual     = true;            // Equal Highs/Lows (EQH/EQL)
+input color           InpLiqEqualColor    = clrGold;         // Цвет EQH/EQL
+input double          InpLiqEqualTolATR   = 0.10;            // Допуск «равенства» (доли ATR)
+
+input bool            InpLiqShowDaily     = true;            // Дневные уровни PDH/PDL и CDH/CDL
+input color           InpLiqDailyColor    = clrMediumPurple; // Цвет дневных уровней
+
+input bool            InpLiqShowSessions  = true;            // Сессионные H/L (ликвидность сессий)
+input color           InpLiqAsiaColor     = C'90,90,170';    // Азия
+input color           InpLiqLondonColor   = C'70,150,90';    // Лондон
+input color           InpLiqNYColor       = C'170,120,60';   // Нью-Йорк
+input int             InpLiqAsiaStart     = 0;               // Азия: старт (час сервера)
+input int             InpLiqAsiaEnd       = 8;               // Азия: конец (час сервера)
+input int             InpLiqLondonStart   = 8;               // Лондон: старт (час сервера)
+input int             InpLiqLondonEnd     = 16;              // Лондон: конец (час сервера)
+input int             InpLiqNYStart       = 13;              // Нью-Йорк: старт (час сервера)
+input int             InpLiqNYEnd         = 21;              // Нью-Йорк: конец (час сервера)
 
 input group "=== Анализ объёмов ==="
 input bool     InpShowVolume       = true;          // Подсветка объёмных свечей
@@ -235,6 +266,19 @@ struct OBData
    datetime checkedUpTo;  // время последнего проверенного бара (для инкремент. mitigation)
 };
 
+// Уровень ликвидности (резерв стопов): BSL над свинг-хаем, SSL под свинг-лоем
+struct LiqLevel
+{
+   string   name;        // имя графического объекта линии
+   datetime time;        // время свинга-источника
+   double   price;       // цена уровня
+   bool     buySide;     // true = BSL (над хаем), false = SSL (под лоем)
+   bool     swept;       // ликвидность снята
+   datetime sweptTime;   // время снятия
+   bool     equal;       // входит в кластер EQH/EQL
+   datetime checkedUpTo; // время последнего проверенного бара (инкремент. проверка снятия)
+};
+
 struct Counters
 {
    int bosBull, bosBear;
@@ -249,6 +293,8 @@ struct Counters
    int mtfChochBull, mtfChochBear;
    int entryUp, entryDn;
    int obStrongBull, obStrongBear;
+   int eqh, eql;           // обнаружено кластеров Equal Highs / Equal Lows
+   int liqSwept;           // снято линий ликвидности (BSL/SSL)
 };
 
 SwingState g_state;
@@ -257,11 +303,13 @@ datetime   g_mtfLastTime  = 0;
 datetime   g_lastVPTime   = 0;
 ENUM_TIMEFRAMES g_lastVPPeriod = PERIOD_CURRENT;
 OBData     g_obs[];
+LiqLevel   g_liq[];        // активные/снятые уровни ликвидности (текущий ТФ)
 Counters   g_cnt;
 DrawCtx    g_ctx;
 DrawCtx    g_ctxMTF;
 datetime   g_lastBarSeen  = 0;
 bool       g_dashCreated  = false;
+bool       g_liqCleared   = false;  // объекты ликвидности очищены (когда модуль выключен)
 // Время последних структурных событий (для проверки «недавности» в Entry)
 datetime   g_lastSweepHighTime = 0;  // была снята ликвидность с верха
 datetime   g_lastSweepLowTime  = 0;  // была снята ликвидность с низа
@@ -322,6 +370,7 @@ int OnInit()
    ResetState(g_mtfState);
    ResetCounters();
    ArrayResize(g_obs, 0);
+   ArrayResize(g_liq, 0);
    g_mtfLastTime = 0;
    g_lastVPTime  = 0;
    g_lastVPPeriod = PERIOD_CURRENT;
@@ -444,6 +493,7 @@ int OnCalculate(const int rates_total,
       ResetState(g_state);
       ResetCounters();
       ArrayResize(g_obs, 0);
+      ArrayResize(g_liq, 0);
       g_lastSweepHighTime = 0;
       g_lastSweepLowTime  = 0;
       g_lastBullStructTime = 0;
@@ -515,6 +565,25 @@ int OnCalculate(const int rates_total,
 
    if(runHeavy && InpShowOB)
       UpdateOBMitigation(time, high, low, rates_total);
+
+   //--- Liquidity Levels: снятие линий + дневные/сессионные уровни
+   if(InpLiqLevelsEnable)
+   {
+      g_liqCleared = false;
+      if(InpLiqShowLines)
+      {
+         UpdateLiquidityTaken(time, high, low, rates_total);
+         PruneLiquidity();
+      }
+      if(runHeavy)
+         UpdateSessionLevels();
+   }
+   else if(!g_liqCleared)
+   {
+      ClearLiquidityObjects();
+      ClearSessionObjects();
+      g_liqCleared = true;
+   }
 
    //--- MTF: пересчитываем только при появлении нового бара старшего ТФ
    if(InpMTFEnable)
@@ -751,6 +820,10 @@ void HandleSwingHigh(int i, const datetime &time[],
       DrawSwingLabel(time[i], high[i], label, true, ctx);
    if(!ctx.isMTF) { if(isHH) g_cnt.swingsHH++; else g_cnt.swingsLH++; }
 
+   // Регистрируем buy-side ликвидность (резерв стопов над свинг-хаем)
+   if(!ctx.isMTF && InpLiqLevelsEnable && InpLiqShowLines)
+      RegisterLiquidity(i, time, high[i], true);
+
    // BOS bull
    if(state.lastH.valid && ctx.showBOS && state.trend != -1 && high[i] > state.lastH.price)
    {
@@ -803,6 +876,10 @@ void HandleSwingLow(int i, const datetime &time[],
    if(ctx.showSwings)
       DrawSwingLabel(time[i], low[i], label, false, ctx);
    if(!ctx.isMTF) { if(isLL) g_cnt.swingsLL++; else g_cnt.swingsHL++; }
+
+   // Регистрируем sell-side ликвидность (резерв стопов под свинг-лоем)
+   if(!ctx.isMTF && InpLiqLevelsEnable && InpLiqShowLines)
+      RegisterLiquidity(i, time, low[i], false);
 
    // BOS bear
    if(state.lastL.valid && ctx.showBOS && state.trend != 1 && low[i] < state.lastL.price)
@@ -901,6 +978,428 @@ void DrawSweep(datetime t, double price, bool isHigh)
    ObjectSetInteger(0, name, OBJPROP_TIME,  t);
    ObjectSetDouble (0, name, OBJPROP_PRICE, price);
    ObjectSetInteger(0, name, OBJPROP_ANCHOR, isHigh ? ANCHOR_BOTTOM : ANCHOR_TOP);
+}
+
+//+==================================================================+
+//| LIQUIDITY LEVELS                                                   |
+//|  • Линии ликвидности от свингов (BSL над хаями / SSL под лоями)    |
+//|  • Авто-снятие (удаление или затемнение) при пробое уровня         |
+//|  • Equal Highs / Equal Lows (EQH / EQL)                            |
+//|  • Дневные (PDH/PDL/CDH/CDL) и сессионные (Asia/London/NY) уровни  |
+//+==================================================================+
+
+// Регистрация уровня ликвидности на подтверждённом свинге
+void RegisterLiquidity(int i, const datetime &time[], double price, bool buySide)
+{
+   int rt = ArraySize(time);
+   datetime t = time[i];
+
+   // Не дублируем уровень с тем же временем/стороной
+   for(int k = 0; k < ArraySize(g_liq); ++k)
+      if(g_liq[k].time == t && g_liq[k].buySide == buySide)
+         return;
+
+   string side = buySide ? "B" : "S";
+   string name = InpObjPrefix + "liql_" + side + "_" + IntegerToString((long)t);
+
+   int sz = ArraySize(g_liq);
+   ArrayResize(g_liq, sz + 1);
+   g_liq[sz].name        = name;
+   g_liq[sz].time        = t;
+   g_liq[sz].price       = price;
+   g_liq[sz].buySide     = buySide;
+   g_liq[sz].swept       = false;
+   g_liq[sz].sweptTime   = 0;
+   g_liq[sz].equal       = false;
+   g_liq[sz].checkedUpTo = t;
+
+   DrawLiqLine(sz);
+
+   // EQH/EQL: близкий по цене активный уровень той же стороны
+   if(InpLiqShowEqual)
+      DetectEqualLevels(sz, rt, i);
+
+   // Ограничение количества активных линий на сторону
+   LimitLiquidity(buySide);
+}
+
+// Отрисовка/обновление линии ликвидности
+void DrawLiqLine(int idx)
+{
+   if(idx < 0 || idx >= ArraySize(g_liq)) return;
+   datetime t1   = g_liq[idx].time;
+   double   p    = g_liq[idx].price;
+   bool     buy  = g_liq[idx].buySide;
+   string   name = g_liq[idx].name;
+
+   datetime t2 = t1 + (datetime)(PeriodSeconds() * 500); // запас; ray дотянет вправо
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, p, t2, p);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, p);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 1, p);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, buy ? InpLiqBuyColor : InpLiqSellColor);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, InpLiqLineStyle);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, InpLiqLineWidth);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, InpLiqExtendActive);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  true);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+
+   if(InpLiqShowLabels)
+      DrawLiqLabel(name + "_lbl", t1, p, buy ? "BSL" : "SSL",
+                   buy ? InpLiqBuyColor : InpLiqSellColor, buy);
+}
+
+void DrawLiqLabel(string name, datetime t, double price, string text, color clr, bool above)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  t);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, price);
+   ObjectSetString (0, name, OBJPROP_TEXT,  " " + text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, above ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+// EQH/EQL: соединяем близкие по цене экстремумы одной стороны
+void DetectEqualLevels(int newIdx, int rates_total, int barIdx)
+{
+   double atr = GetATR(rates_total, barIdx);
+   double tol = (atr > 0.0) ? atr * InpLiqEqualTolATR : 0.0;
+   if(tol <= 0.0) tol = _Point * 20.0; // запасной допуск
+
+   bool   buy = g_liq[newIdx].buySide;
+   double p   = g_liq[newIdx].price;
+
+   int    bestJ    = -1;
+   double bestDiff = tol;
+   for(int j = 0; j < ArraySize(g_liq); ++j)
+   {
+      if(j == newIdx)              continue;
+      if(g_liq[j].buySide != buy)  continue;
+      if(g_liq[j].swept)           continue;
+      double diff = MathAbs(g_liq[j].price - p);
+      if(diff <= bestDiff) { bestDiff = diff; bestJ = j; }
+   }
+   if(bestJ < 0) return;
+
+   g_liq[newIdx].equal = true;
+   g_liq[bestJ].equal  = true;
+
+   double pe   = (g_liq[newIdx].price + g_liq[bestJ].price) * 0.5;
+   string tag  = buy ? "EQH" : "EQL";
+   string name = InpObjPrefix + "liqe_" + (buy ? "H_" : "L_") + IntegerToString((long)g_liq[newIdx].time);
+
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, g_liq[bestJ].time, pe, g_liq[newIdx].time, pe);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  0, g_liq[bestJ].time);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, pe);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  1, g_liq[newIdx].time);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 1, pe);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, InpLiqEqualColor);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  true);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+
+   if(buy) g_cnt.eqh++; else g_cnt.eql++;
+
+   if(InpLiqShowLabels)
+      DrawLiqLabel(name + "_lbl", g_liq[newIdx].time, pe, tag, InpLiqEqualColor, buy);
+}
+
+// Оставляем не более InpLiqMaxPerSide активных линий на сторону (старые удаляем)
+void LimitLiquidity(bool buySide)
+{
+   if(InpLiqMaxPerSide <= 0) return;
+
+   int      idxs[];
+   datetime tms[];
+   for(int i = 0; i < ArraySize(g_liq); ++i)
+   {
+      if(g_liq[i].buySide != buySide) continue;
+      if(g_liq[i].swept)              continue;
+      int s = ArraySize(idxs);
+      ArrayResize(idxs, s + 1);
+      ArrayResize(tms,  s + 1);
+      idxs[s] = i;
+      tms[s]  = g_liq[i].time;
+   }
+   int cnt = ArraySize(idxs);
+   if(cnt <= InpLiqMaxPerSide) return;
+
+   for(int a = 0; a < cnt - 1; ++a)
+      for(int b = a + 1; b < cnt; ++b)
+         if(tms[a] > tms[b])
+         {
+            datetime tt = tms[a]; tms[a] = tms[b]; tms[b] = tt;
+            int      ii = idxs[a]; idxs[a] = idxs[b]; idxs[b] = ii;
+         }
+
+   int toDelete = cnt - InpLiqMaxPerSide;
+   string delNames[];
+   for(int x = 0; x < toDelete; ++x)
+   {
+      int s = ArraySize(delNames);
+      ArrayResize(delNames, s + 1);
+      delNames[s] = g_liq[idxs[x]].name;
+   }
+   for(int x = 0; x < ArraySize(delNames); ++x)
+      RemoveLiqByName(delNames[x]);
+}
+
+void RemoveLiqByName(string name)
+{
+   int sz = ArraySize(g_liq);
+   for(int i = 0; i < sz; ++i)
+   {
+      if(g_liq[i].name == name)
+      {
+         ObjectDelete(0, g_liq[i].name);
+         ObjectDelete(0, g_liq[i].name + "_lbl");
+         for(int j = i; j < sz - 1; ++j) g_liq[j] = g_liq[j + 1];
+         ArrayResize(g_liq, sz - 1);
+         return;
+      }
+   }
+}
+
+// Снятие ликвидности: цена прошла сквозь уровень (инкрементально, как OB mitigation)
+void UpdateLiquidityTaken(const datetime &time[], const double &high[],
+                          const double &low[], int rates_total)
+{
+   datetime latestBar = time[rates_total - 1];
+   for(int idx = 0; idx < ArraySize(g_liq); ++idx)
+   {
+      if(g_liq[idx].swept) continue;
+      if(g_liq[idx].checkedUpTo >= latestBar) continue;
+
+      datetime sinceTime = (g_liq[idx].checkedUpTo > g_liq[idx].time)
+                              ? g_liq[idx].checkedUpTo
+                              : g_liq[idx].time;
+      int startBar = FindBarByTime(time, rates_total, sinceTime);
+      if(startBar < 0) startBar = 0;
+      startBar++;
+      if(startBar < 1) startBar = 1;
+
+      datetime takenTime = 0;
+      for(int b = startBar; b < rates_total; ++b)
+      {
+         if(g_liq[idx].buySide)
+         {
+            if(high[b] > g_liq[idx].price) { takenTime = time[b]; break; }
+         }
+         else
+         {
+            if(low[b] < g_liq[idx].price)  { takenTime = time[b]; break; }
+         }
+      }
+      if(takenTime != 0)
+         MarkLiqSwept(idx, takenTime);
+      else
+         g_liq[idx].checkedUpTo = latestBar;
+   }
+}
+
+void MarkLiqSwept(int idx, datetime sweptTime)
+{
+   g_liq[idx].swept     = true;
+   g_liq[idx].sweptTime = sweptTime;
+   g_cnt.liqSwept++;
+
+   string name = g_liq[idx].name;
+   if(InpLiqRemoveOnSweep)
+   {
+      ObjectDelete(0, name);
+      ObjectDelete(0, name + "_lbl");
+      return;
+   }
+   // затемняем и фиксируем конец линии на моменте снятия
+   ObjectSetInteger(0, name, OBJPROP_COLOR, InpLiqSweptColor);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, name, OBJPROP_TIME, 1, sweptTime);
+   ObjectDelete(0, name + "_lbl");
+}
+
+// Чистка массива: удаляем снятые (при режиме удаления) либо ограничиваем их число
+void PruneLiquidity()
+{
+   if(InpLiqRemoveOnSweep)
+   {
+      string names[];
+      for(int i = 0; i < ArraySize(g_liq); ++i)
+         if(g_liq[i].swept)
+         {
+            int s = ArraySize(names); ArrayResize(names, s + 1); names[s] = g_liq[i].name;
+         }
+      for(int i = 0; i < ArraySize(names); ++i) RemoveLiqByName(names[i]);
+      return;
+   }
+
+   int      maxSwept = 60;
+   int      idxs[];
+   datetime tms[];
+   for(int i = 0; i < ArraySize(g_liq); ++i)
+   {
+      if(!g_liq[i].swept) continue;
+      int s = ArraySize(idxs); ArrayResize(idxs, s + 1); ArrayResize(tms, s + 1);
+      idxs[s] = i; tms[s] = g_liq[i].sweptTime;
+   }
+   int cnt = ArraySize(idxs);
+   if(cnt <= maxSwept) return;
+
+   for(int a = 0; a < cnt - 1; ++a)
+      for(int b = a + 1; b < cnt; ++b)
+         if(tms[a] > tms[b])
+         {
+            datetime tt = tms[a]; tms[a] = tms[b]; tms[b] = tt;
+            int      ii = idxs[a]; idxs[a] = idxs[b]; idxs[b] = ii;
+         }
+
+   int toDelete = cnt - maxSwept;
+   string delNames[];
+   for(int x = 0; x < toDelete; ++x)
+   {
+      int s = ArraySize(delNames); ArrayResize(delNames, s + 1); delNames[s] = g_liq[idxs[x]].name;
+   }
+   for(int x = 0; x < ArraySize(delNames); ++x) RemoveLiqByName(delNames[x]);
+}
+
+void ClearLiquidityObjects()
+{
+   string tags[2] = {"liql_", "liqe_"};
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = total - 1; i >= 0; --i)
+   {
+      string nm = ObjectName(0, i, -1, -1);
+      for(int t = 0; t < 2; ++t)
+         if(StringFind(nm, InpObjPrefix + tags[t]) == 0) { ObjectDelete(0, nm); break; }
+   }
+   ArrayResize(g_liq, 0);
+}
+
+//+==================================================================+
+//| Дневные и сессионные уровни ликвидности                           |
+//+==================================================================+
+
+// High/Low в заданном диапазоне времени на текущем ТФ
+bool ComputeRangeHL(datetime fromT, datetime toT, double &outHi, double &outLo)
+{
+   if(toT <= fromT) return false;
+   double hi[], lo[];
+   int nh = CopyHigh(_Symbol, _Period, fromT, toT, hi);
+   int nl = CopyLow (_Symbol, _Period, fromT, toT, lo);
+   if(nh <= 0 || nl <= 0) return false;
+   int mxi = ArrayMaximum(hi);
+   int mni = ArrayMinimum(lo);
+   if(mxi < 0 || mni < 0) return false;
+   outHi = hi[mxi];
+   outLo = lo[mni];
+   return true;
+}
+
+void UpdateSessionLevels()
+{
+   ClearSessionObjects();
+   if(!InpLiqLevelsEnable) return;
+   if(!InpLiqShowDaily && !InpLiqShowSessions) return;
+
+   datetime now       = TimeCurrent();
+   datetime rightEdge = now + (datetime)(PeriodSeconds() * 30);
+
+   // --- Дневные уровни: PDH/PDL (вчера) и CDH/CDL (сегодня) ---
+   if(InpLiqShowDaily)
+   {
+      double   pdh = iHigh(_Symbol, PERIOD_D1, 1);
+      double   pdl = iLow (_Symbol, PERIOD_D1, 1);
+      double   cdh = iHigh(_Symbol, PERIOD_D1, 0);
+      double   cdl = iLow (_Symbol, PERIOD_D1, 0);
+      datetime pdT = iTime(_Symbol, PERIOD_D1, 1);
+      datetime cdT = iTime(_Symbol, PERIOD_D1, 0);
+      if(pdh > 0) DrawSessionLine("PDH", pdT, rightEdge, pdh, InpLiqDailyColor, true);
+      if(pdl > 0) DrawSessionLine("PDL", pdT, rightEdge, pdl, InpLiqDailyColor, false);
+      if(cdh > 0) DrawSessionLine("CDH", cdT, rightEdge, cdh, InpLiqDailyColor, true);
+      if(cdl > 0) DrawSessionLine("CDL", cdT, rightEdge, cdl, InpLiqDailyColor, false);
+   }
+
+   // --- Сессионные H/L текущего дня ---
+   if(InpLiqShowSessions)
+   {
+      datetime dayStart = iTime(_Symbol, PERIOD_D1, 0);
+      if(dayStart > 0)
+      {
+         DrawSessionRange("Asia",   dayStart, InpLiqAsiaStart,   InpLiqAsiaEnd,   InpLiqAsiaColor,   rightEdge);
+         DrawSessionRange("London", dayStart, InpLiqLondonStart, InpLiqLondonEnd, InpLiqLondonColor, rightEdge);
+         DrawSessionRange("NY",     dayStart, InpLiqNYStart,     InpLiqNYEnd,     InpLiqNYColor,     rightEdge);
+      }
+   }
+}
+
+void DrawSessionRange(string label, datetime dayStart, int hStart, int hEnd, color clr, datetime rightEdge)
+{
+   if(hEnd <= hStart) return;
+   datetime sStart  = dayStart + (datetime)(hStart * 3600);
+   datetime sEnd    = dayStart + (datetime)(hEnd   * 3600);
+   datetime now     = TimeCurrent();
+   datetime sEndEff = (sEnd > now) ? now : sEnd; // сессия ещё может быть открыта
+   if(sEndEff <= sStart) return;                 // сессия ещё не началась
+   double hi, lo;
+   if(!ComputeRangeHL(sStart, sEndEff, hi, lo)) return;
+   DrawSessionLine(label + " H", sStart, rightEdge, hi, clr, true);
+   DrawSessionLine(label + " L", sStart, rightEdge, lo, clr, false);
+}
+
+void DrawSessionLine(string label, datetime t1, datetime t2, double price, color clr, bool above)
+{
+   string name = InpObjPrefix + "liqs_" + label + "_" + IntegerToString((long)t1);
+   StringReplace(name, " ", "_");
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, price, t2, price);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASHDOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  true);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+
+   if(InpLiqShowLabels)
+   {
+      string lbl = name + "_lbl";
+      if(ObjectFind(0, lbl) < 0)
+         ObjectCreate(0, lbl, OBJ_TEXT, 0, t2, price);
+      ObjectSetInteger(0, lbl, OBJPROP_TIME,  t2);
+      ObjectSetDouble (0, lbl, OBJPROP_PRICE, price);
+      ObjectSetString (0, lbl, OBJPROP_TEXT,  " " + label);
+      ObjectSetInteger(0, lbl, OBJPROP_COLOR, clr);
+      ObjectSetInteger(0, lbl, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, lbl, OBJPROP_ANCHOR, above ? ANCHOR_RIGHT_LOWER : ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, lbl, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, lbl, OBJPROP_HIDDEN, true);
+   }
+}
+
+void ClearSessionObjects()
+{
+   string p = InpObjPrefix + "liqs_";
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = total - 1; i >= 0; --i)
+   {
+      string nm = ObjectName(0, i, -1, -1);
+      if(StringFind(nm, p) == 0) ObjectDelete(0, nm);
+   }
 }
 
 //+==================================================================+
@@ -1713,6 +2212,19 @@ void DashboardUpdate()
    DashLineSet(row++, StringFormat("OB+   active %d  mit %d  strong %d", g_cnt.obBullActive, g_cnt.obBullMit, g_cnt.obStrongBull), InpDashTextColor);
    DashLineSet(row++, StringFormat("OB-   active %d  mit %d  strong %d", g_cnt.obBearActive, g_cnt.obBearMit, g_cnt.obStrongBear), InpDashTextColor);
    DashLineSet(row++, StringFormat("FVG   +%d  / -%d",        g_cnt.fvgBull,      g_cnt.fvgBear),   InpDashTextColor);
+
+   if(InpLiqLevelsEnable)
+   {
+      int liqB = 0, liqS = 0;
+      for(int q = 0; q < ArraySize(g_liq); ++q)
+      {
+         if(g_liq[q].swept) continue;
+         if(g_liq[q].buySide) liqB++; else liqS++;
+      }
+      DashLineSet(row++, "─ Ликвидность ─",                                                         InpDashAccent);
+      DashLineSet(row++, StringFormat("BSL %d  / SSL %d  активны", liqB, liqS),                      InpDashTextColor);
+      DashLineSet(row++, StringFormat("Снято %d   EQH %d / EQL %d", g_cnt.liqSwept, g_cnt.eqh, g_cnt.eql), InpDashTextColor);
+   }
 
    DashLineSet(row++, "─ Объём ─",                                                             InpDashAccent);
    DashLineSet(row++, StringFormat("Громких +%d / -%d  (×%.2f)", g_cnt.hivolUp, g_cnt.hivolDn, InpVolumeMultiplier), InpDashTextColor);
