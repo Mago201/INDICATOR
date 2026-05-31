@@ -53,6 +53,9 @@ input int      InpOBExtendBars     = 30;            // Длина OB вправ�
 input bool     InpOBHideMitigated  = false;         // Скрывать сработавшие OB
 input color    InpOBMitigatedClr   = clrDimGray;    // Цвет сработавшего OB
 input bool     InpOBExtendOnTouch  = true;          // Обрезать OB по моменту касания
+input bool     InpOBShowVolume     = true;          // Показывать макс. объём внутри OB
+input color    InpOBVolTextColor   = clrWhite;      // Цвет текста объёма OB
+input int      InpOBVolFontSize    = 8;             // Размер шрифта объёма OB
 
 input group "=== Fair Value Gaps ==="
 input bool     InpShowFVG          = true;          // Показывать FVG / имбалансы
@@ -276,6 +279,7 @@ struct OBData
    bool     mitigated;
    bool     mtf;
    bool     strong;     // OB после которого был FVG-импульс (displacement)
+   long     maxVol;     // максимальный объём внутри зоны OB (OB-бар + импульс до слома)
    datetime checkedUpTo;  // время последнего проверенного бара (для инкремент. mitigation)
 };
 
@@ -562,7 +566,7 @@ int OnCalculate(const int rates_total,
       if(InpShowFVG && i >= 2)
          DetectFVG(i, time, high, low);
       DetectSwingGeneric(i, InpSwingLength,
-                         time, open, high, low, close,
+                         time, open, high, low, close, tick_volume, volume,
                          g_state, g_ctx, _Period, InpOBExtendBars, InpOBMaxCount);
       if(InpEntryEnable)
          DetectEntry(i, rates_total, time, open, high, low, close);
@@ -791,6 +795,7 @@ void LimitObjectsByTag(string tag, int maxCount, string ctxPrefixOverride)
    {
       RemoveOBFromArray(names[x]);
       ObjectDelete(0, names[x]);
+      ObjectDelete(0, names[x] + "_v");   // подпись объёма OB
    }
 }
 
@@ -803,6 +808,8 @@ void DetectSwingGeneric(int i, int swingLen,
                         const double   &high[],
                         const double   &low[],
                         const double   &close[],
+                        const long     &tickv[],
+                        const long     &realv[],
                         SwingState     &state,
                         DrawCtx        &ctx,
                         ENUM_TIMEFRAMES tf,
@@ -821,15 +828,16 @@ void DetectSwingGeneric(int i, int swingLen,
       if(!isHigh && !isLow) break;
    }
 
-   if(isHigh) HandleSwingHigh(i, time, open, high, low, close,
+   if(isHigh) HandleSwingHigh(i, time, open, high, low, close, tickv, realv,
                               state, ctx, tf, obExtendBars, obMaxCount);
-   if(isLow ) HandleSwingLow (i, time, open, high, low, close,
+   if(isLow ) HandleSwingLow (i, time, open, high, low, close, tickv, realv,
                               state, ctx, tf, obExtendBars, obMaxCount);
 }
 
 void HandleSwingHigh(int i, const datetime &time[],
                      const double &open[], const double &high[],
                      const double &low[],  const double &close[],
+                     const long &tickv[], const long &realv[],
                      SwingState &state, DrawCtx &ctx,
                      ENUM_TIMEFRAMES tf, int obExtendBars, int obMaxCount)
 {
@@ -853,7 +861,7 @@ void HandleSwingHigh(int i, const datetime &time[],
       if(ctx.isMTF) g_cnt.mtfBosBull++; else { g_cnt.bosBull++; g_lastBullStructTime = time[i]; }
 
       if(ctx.showOB)
-         TryDrawOB(i, true, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
+         TryDrawOB(i, true, time, open, high, low, close, tickv, realv, ctx, tf, obExtendBars, obMaxCount);
    }
    // CHoCH bull (разворот из медвежьего тренда)
    else if(state.lastH.valid && ctx.showCHOCH && state.trend == -1 && high[i] > state.lastH.price)
@@ -865,7 +873,7 @@ void HandleSwingHigh(int i, const datetime &time[],
       if(ctx.isMTF) g_cnt.mtfChochBull++; else { g_cnt.chochBull++; g_lastBullStructTime = time[i]; g_lastBullChochTime = time[i]; }
 
       if(ctx.showOB)
-         TryDrawOB(i, true, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
+         TryDrawOB(i, true, time, open, high, low, close, tickv, realv, ctx, tf, obExtendBars, obMaxCount);
    }
 
    // Liquidity sweep — только для текущего ТФ
@@ -887,6 +895,7 @@ void HandleSwingHigh(int i, const datetime &time[],
 void HandleSwingLow(int i, const datetime &time[],
                     const double &open[], const double &high[],
                     const double &low[],  const double &close[],
+                    const long &tickv[], const long &realv[],
                     SwingState &state, DrawCtx &ctx,
                     ENUM_TIMEFRAMES tf, int obExtendBars, int obMaxCount)
 {
@@ -910,7 +919,7 @@ void HandleSwingLow(int i, const datetime &time[],
       if(ctx.isMTF) g_cnt.mtfBosBear++; else { g_cnt.bosBear++; g_lastBearStructTime = time[i]; }
 
       if(ctx.showOB)
-         TryDrawOB(i, false, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
+         TryDrawOB(i, false, time, open, high, low, close, tickv, realv, ctx, tf, obExtendBars, obMaxCount);
    }
    // CHoCH bear
    else if(state.lastL.valid && ctx.showCHOCH && state.trend == 1 && low[i] < state.lastL.price)
@@ -922,7 +931,7 @@ void HandleSwingLow(int i, const datetime &time[],
       if(ctx.isMTF) g_cnt.mtfChochBear++; else { g_cnt.chochBear++; g_lastBearStructTime = time[i]; g_lastBearChochTime = time[i]; }
 
       if(ctx.showOB)
-         TryDrawOB(i, false, time, open, high, low, close, ctx, tf, obExtendBars, obMaxCount);
+         TryDrawOB(i, false, time, open, high, low, close, tickv, realv, ctx, tf, obExtendBars, obMaxCount);
    }
 
    if(!ctx.isMTF && ctx.showSweep && state.lastL.valid &&
@@ -1433,6 +1442,7 @@ void TryDrawOB(int i, bool bull,
                const datetime &time[],
                const double &open[], const double &high[],
                const double &low[],  const double &close[],
+               const long &tickv[], const long &realv[],
                DrawCtx &ctx, ENUM_TIMEFRAMES tf,
                int obExtendBars, int obMaxCount)
 {
@@ -1457,6 +1467,9 @@ void TryDrawOB(int i, bool bull,
    // Displacement-проверка: появился ли FVG в импульсе после OB до свинга
    bool strong = DetectImpulseFVG(ob, i, bull, high, low);
 
+   // Максимальный объём внутри зоны OB: от OB-бара до бара слома структуры
+   long maxVol = MaxVolumeInRange(ob, i, tickv, realv);
+
    string tag  = bull ? "obB_" : "obS_";
    string name = ctx.prefix + tag + IntegerToString((long)t1);
    color  clr  = bull ? ctx.obBullClr : ctx.obBearClr;
@@ -1475,8 +1488,12 @@ void TryDrawOB(int i, bool bull,
    ObjectSetInteger(0, name, OBJPROP_STYLE, strong ? STYLE_SOLID : STYLE_SOLID);
    ObjectSetInteger(0, name, OBJPROP_WIDTH, strong ? 2 : 1);
 
+   // Подпись с максимальным объёмом внутри OB
+   if(InpOBShowVolume && maxVol > 0)
+      DrawOBVolumeLabel(name + "_v", t1, hi, lo, maxVol);
+
    // Регистрируем в массиве для трекинга mitigation
-   AddOrUpdateOB(name, t1, hi, lo, t2, bull, ctx.isMTF, strong);
+   AddOrUpdateOB(name, t1, hi, lo, t2, bull, ctx.isMTF, strong, maxVol);
 
    if(bull) g_cnt.obBullActive++;
    else     g_cnt.obBearActive++;
@@ -1484,6 +1501,38 @@ void TryDrawOB(int i, bool bull,
    // Лимит активных OB
    string limitTag = ctx.isMTF ? ("mtf_" + tag) : tag;
    LimitObjectsByTag(limitTag, obMaxCount, "");
+}
+
+// Максимальный объём (tick/real по InpVolumeType) на барах [from..to]
+long MaxVolumeInRange(int from, int to, const long &tickv[], const long &realv[])
+{
+   if(from > to) { int tmp = from; from = to; to = tmp; }
+   if(from < 0) from = 0;
+   long mx = 0;
+   for(int k = from; k <= to; ++k)
+   {
+      long v = GetVolume(k, tickv, realv);
+      if(v > mx) mx = v;
+   }
+   return mx;
+}
+
+// Текстовая подпись с объёмом внутри прямоугольника OB
+void DrawOBVolumeLabel(string name, datetime t, double hi, double lo, long vol)
+{
+   double y = (hi + lo) / 2.0;
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TEXT, 0, t, y);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  t);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, y);
+   ObjectSetString (0, name, OBJPROP_TEXT,  " V:" + FormatVolume(vol));
+   ObjectSetString (0, name, OBJPROP_FONT,  "Consolas");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpOBVolFontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, InpOBVolTextColor);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT);
+   ObjectSetInteger(0, name, OBJPROP_BACK,  false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
 }
 
 // Проверка наличия FVG в (obBar..swingBar] нужного направления — признак displacement
@@ -1501,7 +1550,7 @@ bool DetectImpulseFVG(int obBar, int swingBar, bool bull,
 }
 
 void AddOrUpdateOB(string name, datetime t, double topP, double botP,
-                   datetime extendTo, bool bull, bool mtf, bool strong)
+                   datetime extendTo, bool bull, bool mtf, bool strong, long maxVol)
 {
    for(int i = 0; i < ArraySize(g_obs); ++i)
    {
@@ -1512,6 +1561,7 @@ void AddOrUpdateOB(string name, datetime t, double topP, double botP,
          g_obs[i].extendTo = extendTo;
          g_obs[i].bull     = bull;
          g_obs[i].mtf      = mtf;
+         if(maxVol > g_obs[i].maxVol) g_obs[i].maxVol = maxVol;
          if(strong && !g_obs[i].strong)
          {
             g_obs[i].strong = true;
@@ -1535,6 +1585,7 @@ void AddOrUpdateOB(string name, datetime t, double topP, double botP,
    g_obs[sz].mtf         = mtf;
    g_obs[sz].mitigated   = false;
    g_obs[sz].strong      = strong;
+   g_obs[sz].maxVol      = maxVol;
    g_obs[sz].checkedUpTo = t;
    if(strong && !mtf)
    {
@@ -1620,6 +1671,7 @@ void MarkOBMitigatedByIndex(int idx, datetime mitTime)
    if(InpOBHideMitigated)
    {
       ObjectDelete(0, g_obs[idx].name);
+      ObjectDelete(0, g_obs[idx].name + "_v");   // подпись объёма OB
    }
    else
    {
@@ -1683,6 +1735,7 @@ void ProcessMTF()
 
    datetime t[];
    double   o[], h[], l[], c[];
+   long     tv[], rv[];
 
    if(CopyTime (_Symbol, InpMTFPeriod, 0, n, t) <= 0) return;
    if(CopyOpen (_Symbol, InpMTFPeriod, 0, n, o) <= 0) return;
@@ -1690,11 +1743,24 @@ void ProcessMTF()
    if(CopyLow  (_Symbol, InpMTFPeriod, 0, n, l) <= 0) return;
    if(CopyClose(_Symbol, InpMTFPeriod, 0, n, c) <= 0) return;
 
+   // Объём старшего ТФ для расчёта макс. объёма в OB
+   if(CopyTickVolume(_Symbol, InpMTFPeriod, 0, n, tv) <= 0)
+      ArrayResize(tv, ArraySize(t));
+   if(InpVolumeType == VOLUME_REAL)
+   {
+      if(CopyRealVolume(_Symbol, InpMTFPeriod, 0, n, rv) <= 0)
+         ArrayResize(rv, ArraySize(t));
+   }
+   else
+      ArrayResize(rv, ArraySize(t));
+
    ArraySetAsSeries(t, false);
    ArraySetAsSeries(o, false);
    ArraySetAsSeries(h, false);
    ArraySetAsSeries(l, false);
    ArraySetAsSeries(c, false);
+   ArraySetAsSeries(tv, false);
+   ArraySetAsSeries(rv, false);
 
    // Чистим прошлые MTF-объекты и MTF OB-записи
    ResetState(g_mtfState);
@@ -1707,7 +1773,7 @@ void ProcessMTF()
    int last_confirmable = total - InpSwingLength - 1;
    for(int i = InpSwingLength; i <= last_confirmable; ++i)
    {
-      DetectSwingGeneric(i, InpSwingLength, t, o, h, l, c,
+      DetectSwingGeneric(i, InpSwingLength, t, o, h, l, c, tv, rv,
                          g_mtfState, g_ctxMTF, InpMTFPeriod,
                          InpOBExtendBars, InpOBMaxCount);
    }
