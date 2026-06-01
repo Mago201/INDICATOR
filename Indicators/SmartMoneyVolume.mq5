@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Mago201 / INDICATR007"
 #property link      "https://github.com/Mago201/INDICATOR"
-#property version   "1.40"
+#property version   "1.50"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 4
@@ -115,6 +115,18 @@ input double   InpVolumeMultiplier = 1.8;
 input bool     InpShowVolText      = false;
 input color    InpVolTextColor     = clrSilver;
 
+input group "=== Delta / Cumulative Delta (footprint по тикам) ==="
+input bool     InpDeltaEnable     = true;       // Включить расчёт дельты по тикам
+input int      InpDeltaLookback   = 120;        // Сколько последних баров считать
+input bool     InpDeltaShowBars   = false;      // Подписывать дельту под каждым баром
+input bool     InpDeltaShowDiv    = true;       // Показывать дивергенции цена/CVD
+input int      InpDeltaDivSwing   = 2;          // Длина фрактала для свингов дельты
+input int      InpDeltaDivRecent  = 30;         // Окно «свежести» дивергенции (баров)
+input color    InpDeltaBullColor  = clrLime;    // Цвет бычьей дельты/дивергенции
+input color    InpDeltaBearColor  = clrRed;     // Цвет медвежьей дельты/дивергенции
+input int      InpDeltaFontSize   = 7;          // Размер шрифта подписей дельты
+input bool     InpDeltaAlertDiv   = false;      // Алерт при дивергенции CVD
+
 input group "=== MTF (старший таймфрейм) ==="
 input bool             InpMTFEnable     = true;          // Включить MTF
 input ENUM_TIMEFRAMES  InpMTFPeriod     = PERIOD_H1;     // Старший ТФ для структуры
@@ -201,6 +213,9 @@ input group "=== Entry: Liquidity grab → CHoCH ==="
 input bool     InpEntryNeedGrabChoCH = false;      // Требовать паттерн: снятие ликвидности → CHoCH в обратную сторону
 input int      InpEntryGrabMaxBars   = 8;          // Макс. баров между снятием ликвидности и CHoCH
 
+input group "=== Entry: Delta (подтверждение объёмом) ==="
+input bool     InpEntryNeedDelta     = false;      // Требовать подтверждение дельтой (BUY: Δ>0, SELL: Δ<0)
+
 input group "=== Entry score (анти всё-или-ничего) ==="
 input bool     InpEntryUseScore          = false;   // Score-режим вместо AND-фильтра
 input int      InpEntryMinScore          = 6;       // Мин. сумма очков для сигнала
@@ -216,6 +231,7 @@ input int      InpEntryWeightRR          = 1;       // Вес: RR >= MinRR
 input int      InpEntryWeightVPCnflu     = 1;       // Вес: близость к POC/VAH/VAL
 input int      InpEntryWeightReject      = 1;       // Вес: rejection-фитиль
 input int      InpEntryWeightGrabChoCH   = 3;       // Вес: liquidity grab → CHoCH
+input int      InpEntryWeightDelta       = 2;       // Вес: дельта подтверждает направление
 
 input group "=== Производительность ==="
 input int      InpHistoryBars      = 1500;        // Глубина истории для анализа (0 = вся; 0 НЕ рекомендую)
@@ -312,6 +328,7 @@ struct Counters
    int obStrongBull, obStrongBear;
    int eqh, eql;           // обнаружено кластеров Equal Highs / Equal Lows
    int liqSwept;           // снято линий ликвидности (BSL/SSL)
+   int dltDivBull, dltDivBear; // обнаружено бычьих/медвежьих дивергенций CVD
 };
 
 SwingState g_state;
@@ -347,6 +364,18 @@ datetime   g_lastEntryUpTime  = 0;
 datetime   g_lastEntryDnTime  = 0;
 double     g_lastEntryUpPrice = 0.0;
 double     g_lastEntryDnPrice = 0.0;
+
+// Delta / Cumulative Delta (footprint по тикам)
+datetime   g_dltTime[];        // время бара (окно последних N закрытых баров, старые->новые)
+double     g_dltHigh[];        // High бара (для поиска свингов дивергенции)
+double     g_dltLow[];         // Low бара
+double     g_dltDelta[];       // дельта бара (buyVol - sellVol)
+double     g_dltCVD[];         // кумулятивная дельта внутри окна
+double     g_dltCurDelta = 0.0;// дельта текущего (формирующегося) бара
+double     g_dltCVDLast  = 0.0;// последнее значение CVD
+int        g_dltDivState = 0;  // 0 нет, 1 бычья дивергенция, -1 медвежья
+datetime   g_dltDivTime  = 0;  // время последней нарисованной дивергенции
+bool       g_dltCleared  = false;
 
 //+==================================================================+
 //| OnInit / OnDeinit                                                 |
@@ -405,6 +434,7 @@ int OnInit()
    g_lastEntryDnPrice = 0.0;
    g_pocPrice = g_vahPrice = g_valPrice = 0.0;
    g_vpReady  = false;
+   ResetDelta();
 
    if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
    g_atrHandle = iATR(_Symbol, _Period, MathMax(2, InpEntryATRPeriod));
@@ -472,6 +502,20 @@ void ResetCounters()
    ZeroMemory(g_cnt);
 }
 
+void ResetDelta()
+{
+   ArrayResize(g_dltTime,  0);
+   ArrayResize(g_dltHigh,  0);
+   ArrayResize(g_dltLow,   0);
+   ArrayResize(g_dltDelta, 0);
+   ArrayResize(g_dltCVD,   0);
+   g_dltCurDelta = 0.0;
+   g_dltCVDLast  = 0.0;
+   g_dltDivState = 0;
+   g_dltDivTime  = 0;
+   g_dltCleared  = false;
+}
+
 void ClearAllObjects()
 {
    int total = ObjectsTotal(0, -1, -1);
@@ -527,6 +571,7 @@ int OnCalculate(const int rates_total,
       g_lastEntryDnPrice = 0.0;
       g_pocPrice = g_vahPrice = g_valPrice = 0.0;
       g_vpReady  = false;
+      ResetDelta();
       ClearAllObjects();
       g_dashCreated = false;
       if(InpDashEnable) { DashboardCreate(); DashboardLayout(); g_dashCreated = true; }
@@ -632,6 +677,10 @@ int OnCalculate(const int rates_total,
       ClearVPObjects();
       g_lastVPTime = 0;
    }
+
+   //--- Delta / CVD: пересчёт по тикам (на новом баре)
+   if(runHeavy)
+      UpdateDelta(time, high, low, rates_total);
 
    //--- Dashboard: пересоздаём только при включении/первом запуске,
    //--- иначе обновляем текст метк (быстро)
@@ -2051,6 +2100,9 @@ void DetectEntry(int i, int rates_total,
       bool pdOk       = IsInPremDiscount(true, price);
       bool rejectOk   = BarRejectionOK(true, open[i], high[i], low[i], close[i]);
       bool grabChOk   = GrabChochOK(true, t);
+      double dltVal   = 0.0;
+      bool   dltKnown = (InpDeltaEnable && LookupDelta(t, dltVal));
+      bool   deltaOk  = (!dltKnown) || (dltVal > 0.0);   // мягко: вне окна тиков не блокируем
       bool vpCnf      = false;
       if(g_vpReady && atr > 0)
       {
@@ -2090,6 +2142,7 @@ void DetectEntry(int i, int rates_total,
          if(vpCnf)                 score += InpEntryWeightVPCnflu;
          if(rejectOk)              score += InpEntryWeightReject;
          if(grabChOk)              score += InpEntryWeightGrabChoCH;
+         if(dltKnown && dltVal > 0.0) score += InpEntryWeightDelta;
          fire = (score >= InpEntryMinScore) && coolOk;
       }
       else
@@ -2113,6 +2166,7 @@ void DetectEntry(int i, int rates_total,
       if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
       if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
       if(fire && InpEntryNeedGrabChoCH && !grabChOk) fire = false;
+      if(fire && InpEntryNeedDelta   && !deltaOk)  fire = false;
       // В score-режиме чекбоксы тренд/OB/etc можно использовать как hard-gate
       if(fire && InpEntryUseScore)
       {
@@ -2149,6 +2203,9 @@ void DetectEntry(int i, int rates_total,
       bool pdOk       = IsInPremDiscount(false, price);
       bool rejectOk   = BarRejectionOK(false, open[i], high[i], low[i], close[i]);
       bool grabChOk   = GrabChochOK(false, t);
+      double dltVal   = 0.0;
+      bool   dltKnown = (InpDeltaEnable && LookupDelta(t, dltVal));
+      bool   deltaOk  = (!dltKnown) || (dltVal < 0.0);   // мягко: вне окна тиков не блокируем
       bool vpCnf      = false;
       if(g_vpReady && atr > 0)
       {
@@ -2188,6 +2245,7 @@ void DetectEntry(int i, int rates_total,
          if(vpCnf)                 score += InpEntryWeightVPCnflu;
          if(rejectOk)              score += InpEntryWeightReject;
          if(grabChOk)              score += InpEntryWeightGrabChoCH;
+         if(dltKnown && dltVal < 0.0) score += InpEntryWeightDelta;
          fire = (score >= InpEntryMinScore) && coolOk;
       }
       else
@@ -2210,6 +2268,7 @@ void DetectEntry(int i, int rates_total,
       if(fire && InpEntryNeedReject  && !rejectOk) fire = false;
       if(fire && InpEntryNeedRR      && !rrOk)     fire = false;
       if(fire && InpEntryNeedGrabChoCH && !grabChOk) fire = false;
+      if(fire && InpEntryNeedDelta   && !deltaOk)  fire = false;
       if(fire && InpEntryUseScore)
       {
          if(InpEntryNeedTrend  && !trendOk)               fire = false;
@@ -2237,6 +2296,328 @@ void EntryAlert(string what, datetime t)
    if(!InpEntryAlert) return;
    if(TimeCurrent() - t > PeriodSeconds() * 2) return;
    Alert(_Symbol, " ", EnumToString(_Period), " ", what, " @ ", TimeToString(t, TIME_DATE|TIME_MINUTES));
+}
+
+//+==================================================================+
+//| DELTA / CUMULATIVE DELTA (footprint по тикам)                      |
+//+==================================================================+
+// Объём одного тика: реальный, иначе тиковый, иначе 1
+long TickVol(const MqlTick &tk)
+{
+   if(tk.volume_real > 0.0) return (long)tk.volume_real;
+   if(tk.volume > 0)        return (long)tk.volume;
+   return 1;
+}
+
+// Удаление всех объектов с заданным префиксом
+void ClearTagObjects(string tag)
+{
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = total - 1; i >= 0; --i)
+   {
+      string nm = ObjectName(0, i, -1, -1);
+      if(StringFind(nm, tag) == 0) ObjectDelete(0, nm);
+   }
+}
+
+void ClearDeltaObjects()
+{
+   ClearTagObjects(InpObjPrefix + "dlt_");
+}
+
+// Дельта (buyVol - sellVol) на интервале [tFrom, tTo) по тикам
+double ComputeBarDelta(datetime tFrom, datetime tTo, bool &ok)
+{
+   ok = false;
+   MqlTick ticks[];
+   ulong from_msc = (ulong)tFrom * 1000;
+   ulong to_msc   = (ulong)tTo   * 1000;
+   if(to_msc <= from_msc) to_msc = from_msc + 1000;
+   to_msc -= 1;  // правую границу делаем эксклюзивной
+
+   int got = CopyTicksRange(_Symbol, ticks, COPY_TICKS_ALL, from_msc, to_msc);
+   if(got <= 0) return 0.0;
+
+   ok = true;
+   long   buy = 0, sell = 0;
+   double prevPrice = 0.0;
+   for(int k = 0; k < got; ++k)
+   {
+      long v = TickVol(ticks[k]);
+      uint f = ticks[k].flags;
+
+      if((f & TICK_FLAG_BUY) != 0)        buy  += v;
+      else if((f & TICK_FLAG_SELL) != 0)  sell += v;
+      else
+      {
+         // Фолбэк (форекс без потока сделок): направление по изменению цены
+         double p = (ticks[k].last > 0.0) ? ticks[k].last
+                                          : ((ticks[k].bid + ticks[k].ask) / 2.0);
+         if(prevPrice > 0.0)
+         {
+            if(p > prevPrice)      buy  += v;
+            else if(p < prevPrice) sell += v;
+         }
+         if(p > 0.0) prevPrice = p;
+      }
+   }
+   return (double)(buy - sell);
+}
+
+// Добавить в окно один закрытый бар с индексом b
+void DeltaAppendBar(int b, const datetime &time[], const double &high[], const double &low[])
+{
+   bool ok = false;
+   double d = ComputeBarDelta(time[b], time[b + 1], ok);
+
+   int sz = ArraySize(g_dltTime);
+   ArrayResize(g_dltTime,  sz + 1);
+   ArrayResize(g_dltHigh,  sz + 1);
+   ArrayResize(g_dltLow,   sz + 1);
+   ArrayResize(g_dltDelta, sz + 1);
+   ArrayResize(g_dltCVD,   sz + 1);
+
+   g_dltTime[sz]  = time[b];
+   g_dltHigh[sz]  = high[b];
+   g_dltLow[sz]   = low[b];
+   g_dltDelta[sz] = d;
+   g_dltCVD[sz]   = 0.0;
+}
+
+// Оставить в окне только последние n баров
+void DeltaTrim(int n)
+{
+   int sz = ArraySize(g_dltTime);
+   if(sz <= n) return;
+   int drop = sz - n;
+   for(int k = 0; k < n; ++k)
+   {
+      g_dltTime[k]  = g_dltTime[k + drop];
+      g_dltHigh[k]  = g_dltHigh[k + drop];
+      g_dltLow[k]   = g_dltLow[k + drop];
+      g_dltDelta[k] = g_dltDelta[k + drop];
+   }
+   ArrayResize(g_dltTime,  n);
+   ArrayResize(g_dltHigh,  n);
+   ArrayResize(g_dltLow,   n);
+   ArrayResize(g_dltDelta, n);
+   ArrayResize(g_dltCVD,   n);
+}
+
+// Поиск дельты бара по времени (для подтверждения входа). Возвращает false,
+// если бар вне окна — тогда фильтр трактуется мягко (не блокирует сигнал).
+bool LookupDelta(datetime t, double &val)
+{
+   int sz = ArraySize(g_dltTime);
+   if(sz == 0) return false;
+   if(t < g_dltTime[0] || t > g_dltTime[sz - 1]) return false;
+   for(int k = sz - 1; k >= 0; --k)
+      if(g_dltTime[k] == t) { val = g_dltDelta[k]; return true; }
+   return false;
+}
+
+string FormatSigned(double v)
+{
+   string s = (v >= 0 ? "+" : "-");
+   double a = MathAbs(v);
+   if(a >= 1000000.0) return s + DoubleToString(a / 1000000.0, 2) + "M";
+   if(a >= 1000.0)    return s + DoubleToString(a / 1000.0, 1)    + "K";
+   return s + DoubleToString(a, 0);
+}
+
+void UpdateDelta(const datetime &time[], const double &high[], const double &low[], int rates_total)
+{
+   if(!InpDeltaEnable)
+   {
+      if(!g_dltCleared)
+      {
+         ClearDeltaObjects();
+         ResetDelta();
+         g_dltCleared = true;
+      }
+      return;
+   }
+   g_dltCleared = false;
+
+   int lastClosed = rates_total - 2;        // последний полностью закрытый бар
+   if(lastClosed < 5) return;
+   int n = (int)MathMin(InpDeltaLookback, lastClosed);
+   if(n < 5) return;
+
+   int sz = ArraySize(g_dltTime);
+   if(sz == 0)
+   {
+      // Полная сборка окна
+      int winStart = lastClosed - n + 1;
+      for(int b = winStart; b <= lastClosed; ++b)
+         DeltaAppendBar(b, time, high, low);
+   }
+   else if(g_dltTime[sz - 1] != time[lastClosed])
+   {
+      // Инкрементально добавляем только новые закрытые бары
+      datetime lastStored = g_dltTime[sz - 1];
+      int b0 = lastClosed;
+      while(b0 > 1 && time[b0 - 1] > lastStored) b0--;
+      for(int b = b0; b <= lastClosed; ++b)
+         DeltaAppendBar(b, time, high, low);
+      DeltaTrim(n);
+   }
+
+   // Пересчёт кумулятивной дельты внутри окна
+   double run = 0.0;
+   int wsz = ArraySize(g_dltDelta);
+   for(int k = 0; k < wsz; ++k)
+   {
+      run += g_dltDelta[k];
+      g_dltCVD[k] = run;
+   }
+   g_dltCVDLast = run;
+
+   // Дельта текущего (формирующегося) бара — для дашборда
+   bool okc = false;
+   g_dltCurDelta = ComputeBarDelta(time[rates_total - 1], TimeCurrent() + 1, okc);
+
+   // Подписи дельты под барами (опционально)
+   ClearTagObjects(InpObjPrefix + "dlt_b_");
+   if(InpDeltaShowBars)
+      DrawDeltaBars();
+
+   // Дивергенции цена/CVD
+   DetectCVDDivergence();
+}
+
+void DrawDeltaBars()
+{
+   int wsz = ArraySize(g_dltTime);
+   for(int k = 0; k < wsz; ++k)
+   {
+      string nm = InpObjPrefix + "dlt_b_" + IntegerToString((long)g_dltTime[k]);
+      double y  = g_dltLow[k];
+      if(ObjectFind(0, nm) < 0)
+         ObjectCreate(0, nm, OBJ_TEXT, 0, g_dltTime[k], y);
+      ObjectSetInteger(0, nm, OBJPROP_TIME,  g_dltTime[k]);
+      ObjectSetDouble (0, nm, OBJPROP_PRICE, y);
+      ObjectSetString (0, nm, OBJPROP_TEXT,  FormatSigned(g_dltDelta[k]));
+      ObjectSetString (0, nm, OBJPROP_FONT,  "Consolas");
+      ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, InpDeltaFontSize);
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, g_dltDelta[k] >= 0 ? InpDeltaBullColor : InpDeltaBearColor);
+      ObjectSetInteger(0, nm, OBJPROP_ANCHOR, ANCHOR_UPPER);
+      ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+   }
+}
+
+// Регулярная дивергенция между ценой и кумулятивной дельтой (CVD)
+void DetectCVDDivergence()
+{
+   g_dltDivState = 0;
+   ClearTagObjects(InpObjPrefix + "dlt_div");
+   if(!InpDeltaShowDiv) return;
+
+   int wsz = ArraySize(g_dltLow);
+   int L = MathMax(1, InpDeltaDivSwing);
+   if(wsz < 2 * L + 3) return;
+
+   // Сбор индексов свинговых лоёв и хаёв (хронологически: старые -> новые)
+   int lowIdx[];  ArrayResize(lowIdx, 0);
+   int highIdx[]; ArrayResize(highIdx, 0);
+   for(int i = L; i <= wsz - L - 1; ++i)
+   {
+      bool isLow = true, isHigh = true;
+      for(int k = 1; k <= L; ++k)
+      {
+         if(g_dltLow[i]  >= g_dltLow[i - k]  || g_dltLow[i]  >= g_dltLow[i + k])  isLow  = false;
+         if(g_dltHigh[i] <= g_dltHigh[i - k] || g_dltHigh[i] <= g_dltHigh[i + k]) isHigh = false;
+      }
+      if(isLow)  { int s = ArraySize(lowIdx);  ArrayResize(lowIdx,  s + 1); lowIdx[s]  = i; }
+      if(isHigh) { int s = ArraySize(highIdx); ArrayResize(highIdx, s + 1); highIdx[s] = i; }
+   }
+
+   int recentBull = -1, recentBear = -1;
+
+   // Бычья: цена LL, CVD HL
+   int nl = ArraySize(lowIdx);
+   if(nl >= 2)
+   {
+      int p = lowIdx[nl - 2];  // предыдущий
+      int r = lowIdx[nl - 1];  // самый свежий
+      if(g_dltLow[r] < g_dltLow[p] && g_dltCVD[r] > g_dltCVD[p])
+         recentBull = r;
+   }
+   // Медвежья: цена HH, CVD LH
+   int nh = ArraySize(highIdx);
+   if(nh >= 2)
+   {
+      int p = highIdx[nh - 2];
+      int r = highIdx[nh - 1];
+      if(g_dltHigh[r] > g_dltHigh[p] && g_dltCVD[r] < g_dltCVD[p])
+         recentBear = r;
+   }
+
+   // Берём только свежие дивергенции
+   int recencyFrom = wsz - 1 - MathMax(1, InpDeltaDivRecent);
+   if(recentBull >= 0 && recentBull < recencyFrom) recentBull = -1;
+   if(recentBear >= 0 && recentBear < recencyFrom) recentBear = -1;
+
+   // Если обе — берём более свежую
+   bool drawBull = (recentBull >= 0) && (recentBear < 0 || recentBull >= recentBear);
+   bool drawBear = (recentBear >= 0) && (recentBull < 0 || recentBear >  recentBull);
+
+   if(drawBull)
+   {
+      int p = lowIdx[ArraySize(lowIdx) - 2];
+      int r = lowIdx[ArraySize(lowIdx) - 1];
+      DrawDivergence(true, g_dltTime[p], g_dltLow[p], g_dltTime[r], g_dltLow[r]);
+      g_dltDivState = 1;
+      if(g_dltTime[r] != g_dltDivTime) { g_cnt.dltDivBull++; g_dltDivTime = g_dltTime[r]; if(InpDeltaAlertDiv) DeltaDivAlert(true, g_dltTime[r]); }
+   }
+   else if(drawBear)
+   {
+      int p = highIdx[ArraySize(highIdx) - 2];
+      int r = highIdx[ArraySize(highIdx) - 1];
+      DrawDivergence(false, g_dltTime[p], g_dltHigh[p], g_dltTime[r], g_dltHigh[r]);
+      g_dltDivState = -1;
+      if(g_dltTime[r] != g_dltDivTime) { g_cnt.dltDivBear++; g_dltDivTime = g_dltTime[r]; if(InpDeltaAlertDiv) DeltaDivAlert(false, g_dltTime[r]); }
+   }
+}
+
+void DrawDivergence(bool bull, datetime t1, double p1, datetime t2, double p2)
+{
+   string nm = InpObjPrefix + "dlt_divLine";
+   color  clr = bull ? InpDeltaBullColor : InpDeltaBearColor;
+   if(ObjectFind(0, nm) < 0)
+      ObjectCreate(0, nm, OBJ_TREND, 0, t1, p1, t2, p2);
+   ObjectSetInteger(0, nm, OBJPROP_TIME,  0, t1);
+   ObjectSetDouble (0, nm, OBJPROP_PRICE, 0, p1);
+   ObjectSetInteger(0, nm, OBJPROP_TIME,  1, t2);
+   ObjectSetDouble (0, nm, OBJPROP_PRICE, 1, p2);
+   ObjectSetInteger(0, nm, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, nm, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, nm, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, nm, OBJPROP_BACK, false);
+   ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+
+   string lbl = InpObjPrefix + "dlt_divLbl";
+   if(ObjectFind(0, lbl) < 0)
+      ObjectCreate(0, lbl, OBJ_TEXT, 0, t2, p2);
+   ObjectSetInteger(0, lbl, OBJPROP_TIME,  t2);
+   ObjectSetDouble (0, lbl, OBJPROP_PRICE, p2);
+   ObjectSetString (0, lbl, OBJPROP_TEXT,  bull ? "  CVD div ▲" : "  CVD div ▼");
+   ObjectSetString (0, lbl, OBJPROP_FONT,  "Consolas");
+   ObjectSetInteger(0, lbl, OBJPROP_FONTSIZE, MathMax(7, InpDeltaFontSize + 1));
+   ObjectSetInteger(0, lbl, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, lbl, OBJPROP_ANCHOR, bull ? ANCHOR_UPPER : ANCHOR_LOWER);
+   ObjectSetInteger(0, lbl, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, lbl, OBJPROP_HIDDEN, true);
+}
+
+void DeltaDivAlert(bool bull, datetime t)
+{
+   if(TimeCurrent() - t > PeriodSeconds() * 3) return;
+   Alert(_Symbol, " ", EnumToString(_Period), " CVD divergence ", (bull ? "BULL" : "BEAR"),
+         " @ ", TimeToString(t, TIME_DATE | TIME_MINUTES));
 }
 
 //+==================================================================+
@@ -2360,6 +2741,20 @@ void DashboardUpdate()
    DashLineSet(row++, "─ Объём ─",                                                             InpDashAccent);
    DashLineSet(row++, StringFormat("Громких +%d / -%d  (×%.2f)", g_cnt.hivolUp, g_cnt.hivolDn, InpVolumeMultiplier), InpDashTextColor);
 
+   if(InpDeltaEnable)
+   {
+      color dClr = (g_dltCurDelta >= 0) ? InpDeltaBullColor : InpDeltaBearColor;
+      color cClr = (g_dltCVDLast  >= 0) ? InpDeltaBullColor : InpDeltaBearColor;
+      string dvs = (g_dltDivState == 1)  ? "BULL ▲"
+                 : (g_dltDivState == -1) ? "BEAR ▼" : "—";
+      color  dvc = (g_dltDivState == 1)  ? InpDeltaBullColor
+                 : (g_dltDivState == -1) ? InpDeltaBearColor : InpDashTextColor;
+      DashLineSet(row++, "─ Delta / CVD ─",                                                      InpDashAccent);
+      DashLineSet(row++, "Δ бар:  " + FormatSigned(g_dltCurDelta),                               dClr);
+      DashLineSet(row++, StringFormat("CVD(%d):  %s", ArraySize(g_dltCVD), FormatSigned(g_dltCVDLast)), cClr);
+      DashLineSet(row++, "Дивергенция:  " + dvs,                                                  dvc);
+   }
+
    if(InpEntryEnable)
    {
       DashLineSet(row++, "─ Entry signals ─",                                                   InpDashAccent);
@@ -2388,7 +2783,7 @@ void DashboardUpdate()
    }
 
    // Скрываем «лишние» строки от прошлых конфигураций (если стало меньше rows)
-   for(int extra = row; extra < 40; ++extra)
+   for(int extra = row; extra < 48; ++extra)
    {
       string nm = InpObjPrefix + "dash_l" + IntegerToString(extra);
       if(ObjectFind(0, nm) >= 0)
